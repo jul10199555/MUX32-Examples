@@ -3,10 +3,10 @@
  * @note          Implements a low power system for 
  *                Multiplexing, Reading, Processing
  *                and saving data coming from a 
- *                21p CNT-GFW sensor
- * @version       0.1
+ *                21p CNT_GFW sensor
+ * @version       0.5
  * @creation date 2025-07-07
- * @updated date  2025-07-11
+ * @updated date  2025-10-07
  * @author        by jul10199555
  * @copyright     Copyright (c) 2025
  * 
@@ -42,8 +42,8 @@
 #define LED_GREEN   PWR_LED
 #define LED_ORANGE  STAT_LED // LED_BLUE
 
-#define GLED_BRIGHTNESS   26
-#define OLED_BRIGHTNESS   64
+#define GLED_BRIGHTNESS   18
+#define OLED_BRIGHTNESS   72
 
 //----------------------------------------------------------------------------------------------------------------------
 // nRF ADC parameters
@@ -186,15 +186,16 @@ uint32_t uSD_row = 1;
 bq25155 charger;
 
 #define INPT_CURRENT_mA  500
-#define BAT_VOLTAGE_mV 4170
-#define CHG_CURRENT_uA  250000
-#define PCHG_CURRENT_uA  25000
+#define BAT_VOLTAGE_mV 4175
+#define CHG_CURRENT_uA  100000
+#define PCHG_CURRENT_uA  15000
 #define SAFETY_TIMER  15
-
-uint16_t VBAT = 0;
 
 bool is_CHG_Set = false, is_CHG_DONE = false;
 bool is_Vin_PG = false, is_PG_En = false;
+
+uint16_t INVo = 0, VBAT = 0;
+uint32_t INCu = 0, ICHG = 0;
 
 //----------------------------------------------------------------------------------------------------------------------
 // AD5242#1 (IC11) + AD5242#2 (IC12)
@@ -272,13 +273,17 @@ const unsigned long DEFAULT_DATA_INTERVAL = 1000;  // ms
 #define MUX32_SEND_DATA       (0x02)
 #define MUX32_CONFIG_DATA     (0x03)
 
+#define MUX32_OPT_NA          'N'
+
+#define MUX_PAY_DEL           ','
+
 enum Mode {
-  MODE_SETUP,
+  MODE_IDLE,
   MODE_CONFIG,
   MODE_DATAREQ
 };
 
-Mode currentMode = MODE_SETUP;
+Mode currentMode = MODE_IDLE;
 
 // Board Models
 #define MUX08_A               "8"
@@ -287,24 +292,33 @@ Mode currentMode = MODE_SETUP;
 #define MUX32_A               "32"
 #define MUX32_B               "MUX32"
 
-// Materials
+// Machines
 #define MUX_SHIMADZU          'S'
 #define MUX_MTS               'T'
 #define MUX_MINI_SMDZ         'M'
 #define MUX_FGR_BEND          'F'
 #define MUX_OAX_STR           'O'
 
+// Materials
+#define CNT_GFW               'C'
+#define GS_GFW                'G'
+#define MWCNT                 'M'
+#define MXENE                 'X'
+#define CX_ALPHA              'A'
+
 // Global Commands
 #define MUX32_ALIVE           '0'
-#define MUX32_CHEN            "ce"
-#define MUX32_CHDIS           "cd"
+#define MUX32_SETUP           '1'
+#define MUX32_CH_EN           "ce"
+#define MUX32_CH_DIS          "cd"
+#define MUX32_CH_VBAT         "vb"
+#define MUX32_CH_STAT         "cs"
 #define MUX32_TARE_HX         't'
 
 // OnTest Commands
 #define MUX32_MANUAL_REQ      'r'
 #define MUX32_PAUSE_TEST      'p'
 #define MUX32_END_OF_TEST     "end"
-
 
 // Board Errors Codes
 #define MUX32_SUCCESS         (0x00)
@@ -330,48 +344,85 @@ Mode currentMode = MODE_SETUP;
 // System State Variables
 //----------------------------------------------------------------------------------------------------------------------
 bool paused = false;
-unsigned long lastDataTime = 0;
 unsigned long dataInterval = DEFAULT_DATA_INTERVAL;
+unsigned long sensInterval = DEFAULT_DATA_INTERVAL;
+unsigned long lastDataTime = 0, lastSensTime = 0;
 
 // --- CONFIGURATION VARIABLES (largest superset needed) ---
+
+uint8_t MUXBoard = 0;
+
+// Sensors configuration
+// BME
+bool TempEn = false;
+//1 = C
+//2 = F
+uint8_t TempUnits = 1;
+bool RHumEn = false;
+bool PresEn = false;
+//1 = hPa
+//2 = mBar
+//3 = mmHg
+uint8_t PresUnits = 1;
+bool GasEn = false;
+//1 = Kohms
+//2 = TVoC
+uint8_t GasUnits = 1;
+// LTR
+bool LUXEn = false;
+//1 = ALS
+//2 = UVS
+uint8_t LUXType = 1;
+uint8_t LUXBits = 16;
+
+// Test settings
 char machineType = 0;
 uint32_t totalCycles = 0;
 uint16_t nominalRPM = 0;
 
 // Variation 1 displacement
-char dispAvailable = 'N';
+bool dispAvailable = false;
 uint8_t dispMaxVoltage = 0;
 uint16_t maxDistance = 0;
-uint8_t distanceUnits = 0;
+//1 = mm
+//2 = cm
+//3 = in
+uint8_t distanceUnits = 1;
 
 // Variation 1 load
-char loadAvailable = 'N';
+bool loadAvailable = false;
 uint8_t loadMaxVoltage = 0;
 uint32_t loadCapacity = 0;
+//1 = g
+//2 = N
+//3 = kg
+//4 = kN
 uint8_t loadUnits = 0;
 
 // Variation 1 external loadcell
-char extLoadAvailable = 'N';
+bool extLoadAvailable = false;
 uint32_t extLoadCapacity = 0;
 uint8_t extLoadUnits = 0;
 
 // Variation 2 variable speed
-char varSpeedAvailable = 'N';
+bool varSpeedAvailable = false;
 float speedStart = 0, speedEnd = 0, speedStep = 0;
 
 // Variation 2 motor angle
 float motorAngle = 0;
-char varAngleAvailable = 'N';
+bool varAngleAvailable = false;
 float angleStart = 0, angleEnd = 0, angleStep = 0;
 
 // Common material/test fields
 char materialType = 0;
 char testType = 0;
 uint16_t matLength = 0, matWidth = 0, matHeight = 0;
-char hasDelam = 'N';
+bool hasDelam = false;
 uint16_t sampleNumber = 0;
 uint16_t totalColumns = 0, totalRows = 0;
 uint16_t totalChannels = 0;
+
+String channelHeader;
 
 // Variation 3 strain
 uint32_t maxStrain = 0;
@@ -393,100 +444,268 @@ int split(const String &str, char delim, String arr[], int maxParts) {
 
 // Parse the initial‐configuration payload; return true on success
 bool parseConfig(const String &payload) {
-  const int MAX_FIELDS = 13;
+  const int MAX_FIELDS = 16;
   String fields[MAX_FIELDS];
-  int n = split(payload, ',', fields, MAX_FIELDS);
+  int n = split(payload, MUX_PAY_DEL, fields, MAX_FIELDS);
 
-  // Determine variation by first field
-  char m = fields[0].charAt(0);
-  if ((m==MUX_SHIMADZU||m==MUX_MTS||m==MUX_MINI_SMDZ) && n==12) {
-    // Variation 1
+  if (n < 1) return false;
+  
+  // Determine MUX board on first field
+  String b = fields[0];
+  b.trim();
+  
+  if (b.equals(MUX32_A) || b.equals(MUX32_B) || b.equalsIgnoreCase("32"))
+    MUXBoard = 32;
+  else if (b.equals(MUX08_A) || b.equals(MUX08_B) || b.equalsIgnoreCase("08"))
+    MUXBoard = 8;
+  else
+    return false;
+
+  // Determine Environmental sensor on second field
+  String env[4];
+  int sbm = split(fields[1], '_', env, 4);
+
+  if (sbm < 1 || sbm > 4) return false;
+
+  // Trim each token
+  for (int i = 0; i < sbm; ++i) env[i].trim();
+  
+  // --- Temperature ---
+  char tm = env[0].length() ? env[0].charAt(0) : MUX32_OPT_NA;
+  if (tm == MUX32_OPT_NA)
+    TempEn = false;
+  else {
+    TempEn = true;
+    if (env[0].equalsIgnoreCase("C"))      TempUnits = 1; //1 = C
+    else if (env[0].equalsIgnoreCase("F")) TempUnits = 2; //2 = F
+    else TempEn = false;
+  }
+  
+  // --- Humidity ---
+  RHumEn = !(env[1].length() && env[1].charAt(0) == MUX32_OPT_NA);
+  
+  // --- Pressure ---
+  char ps = env[2].length() ? env[2].charAt(0) : MUX32_OPT_NA;
+  if (ps == MUX32_OPT_NA)
+    PresEn = false;
+  else {
+    PresEn = true;
+    if      (env[2].equalsIgnoreCase("hPa"))  PresUnits = 1; //1 = hPa
+    else if (env[2].equalsIgnoreCase("mBar")) PresUnits = 2; //2 = mBar
+    else if (env[2].equalsIgnoreCase("mmHg")) PresUnits = 3; //3 = mmHg
+    else PresEn = false;
+  }
+
+  // --- Gas ---
+  char gs = env[3].length() ? env[3].charAt(0) : MUX32_OPT_NA;
+  if (gs == MUX32_OPT_NA)
+    GasEn = false;
+  else {
+    GasEn = true;
+    if      (env[3].equalsIgnoreCase("KOhms")) GasUnits = 1; //1 = KOhms
+    else if (env[3].equalsIgnoreCase("TVoC"))  GasUnits = 2; //2 = TVoC
+    else GasEn = false;
+  }
+  
+  // Determine LUX sensor on third field
+  String lux[2];
+  int slx = split(fields[2], '_', lux, 2);
+  
+  if (slx < 1 || slx > 2) return false;
+  
+  // Trim each token
+  for (int i = 0; i < slx; ++i) lux[i].trim();
+
+  if (slx == 2) {
+    LUXEn = true;
+    
+    if      (lux[0].equalsIgnoreCase("ALS")) LUXType = 1; //1 = ALS
+    else if (lux[0].equalsIgnoreCase("UVS")) LUXType = 2; //2 = UVS
+    else LUXEn = false;
+
+    LUXBits = (uint8_t) lux[1].toInt();
+    
+    if (LUXBits < 13)
+      LUXBits = 13;
+    else if (LUXBits > 20)
+      LUXBits = 20;
+  } else
+    LUXEn = false;
+  
+  // Determine variation by fourth field
+  char m = fields[3].charAt(0);
+  
+  if ((m==MUX_SHIMADZU || m==MUX_MTS || m==MUX_MINI_SMDZ) && n==14) { // Variation 1
     machineType = m;
-    totalCycles = (uint32_t) fields[1].toInt();
+
+    String cy = fields[4];
+    cy.trim();
+    
+    unsigned long tc = cy.toInt();
+    if (tc < 1UL || tc > 9999999UL) return false;
+
+    totalCycles = (uint32_t)tc;
     
     // D_/N_ sub‐fields
-    String sub[4];
-    split(fields[2], '_', sub, 4);
-    if (sub[0]!="D" && sub[0]!="N") return false;
-    dispAvailable    = sub[0].charAt(0);
-    dispMaxVoltage   = (uint8_t) sub[1].toInt();
-    maxDistance      = (uint16_t) sub[2].toInt();
-    distanceUnits    = (uint8_t) sub[3].toInt();
+    String sub5[4];
+    split(fields[5], '_', sub5, 4);
+    char ds = sub5[0].length() ? sub5[0].charAt(0) : MUX32_OPT_NA;
+    
+    if (ds == MUX32_OPT_NA)
+      dispAvailable = false;
+    else {
+      dispAvailable = true;
+      
+      dispMaxVoltage = (uint8_t) sub5[1].toInt();
+      maxDistance    = (uint16_t) sub5[2].toInt();
+      distanceUnits  = (uint8_t) sub5[3].toInt(); //1 = mm, 2 = cm, 3 = in
+    }
     
     // L_/N_ sub‐fields
-    split(fields[3], '_', sub, 4);
-    if (sub[0]!="L" && sub[0]!="N") return false;
-    loadAvailable    = sub[0].charAt(0);
-    loadMaxVoltage   = (uint8_t) sub[1].toInt();
-    loadCapacity     = (uint32_t) sub[2].toInt();
-    loadUnits        = (uint8_t) sub[3].toInt();
-    
-    // H_/N_ sub‐fields
-    split(fields[4], '_', sub, 3);
-    if (sub[0]!="H" && sub[0]!="N") return false;
-    extLoadAvailable = sub[0].charAt(0);
-    extLoadCapacity  = (uint32_t) sub[1].toInt();
-    extLoadUnits     = (uint8_t) sub[2].toInt();
-    materialType     = fields[5].charAt(0);
-    testType         = fields[6].charAt(0);
-    
-    split(fields[7], '_', sub, 3);
-    matLength        = (uint16_t) sub[0].toInt();
-    matWidth         = (uint16_t) sub[1].toInt();
-    matHeight        = (uint16_t) sub[2].toInt();
-    hasDelam         = fields[8].charAt(0);
-    sampleNumber     = (uint16_t) fields[9].toInt();
-    
-    split(fields[10], '_', sub, 2);
-    totalColumns     = (uint16_t) sub[0].toInt();
-    totalRows        = (uint16_t) sub[1].toInt();
-    totalChannels    = (uint16_t) fields[11].toInt();
-    
-    return true;
-    
-  } else if (m==MUX_FGR_BEND && n==13) {
-    // Variation 2
-    machineType      = m;
-    totalCycles      = (uint32_t) fields[1].toInt();
-    nominalRPM       = (uint16_t) fields[2].toInt();
-    
-    String sub4[4];
-    split(fields[3], '_', sub4, 4);
-    if (sub4[0]!="S" && sub4[0]!="N") return false;
-    varSpeedAvailable= sub4[0].charAt(0);
-    speedStart       = sub4[1].toFloat();
-    speedEnd         = sub4[2].toFloat();
-    speedStep        = sub4[3].toFloat();
-    motorAngle       = fields[4].toFloat();
-    
     String sub6[4];
-    split(fields[5], '_', sub6, 4);
-    if (sub6[0]!="A" && sub6[0]!="N") return false;
-    varAngleAvailable= sub6[0].charAt(0);
-    angleStart       = sub6[1].toFloat();
-    angleEnd         = sub6[2].toFloat();
-    angleStep        = sub6[3].toFloat();
-    materialType     = fields[6].charAt(0);
-    testType         = fields[7].charAt(0);
+    split(fields[6], '_', sub6, 4);
+    char ld = sub6[0].length() ? sub6[0].charAt(0) : MUX32_OPT_NA;
     
-    String sub9[3];
-    split(fields[8], '_', sub9, 3);
-    matLength        = (uint16_t) sub9[0].toInt();
-    matWidth         = (uint16_t) sub9[1].toInt();
-    matHeight        = (uint16_t) sub9[2].toInt();
-    hasDelam         = fields[9].charAt(0);
-    sampleNumber     = (uint16_t) fields[10].toInt();
+    if (ld == MUX32_OPT_NA)
+      loadAvailable = false;
+    else {
+      loadAvailable = true;
+      
+      loadMaxVoltage   = (uint8_t) sub6[1].toInt();
+      loadCapacity     = (uint32_t) sub6[2].toInt();
+      loadUnits        = (uint8_t) sub6[3].toInt(); //1 = g, 2 = N, 3 = kg, 4 = kN
+    }
+
+    // H_/N_ sub‐fields
+    String sub7[3];
+    split(fields[7], '_', sub7, 3);
+    char h7 = sub7[0].length() ? sub7[0].charAt(0) : MUX32_OPT_NA;
     
-    String sub11[2];
-    split(fields[11], '_', sub11, 2);
-    totalColumns     = (uint16_t) sub11[0].toInt();
-    totalRows        = (uint16_t) sub11[1].toInt();
-    totalChannels    = (uint16_t) fields[12].toInt();
+    if (h7 == MUX32_OPT_NA)
+      extLoadAvailable = false;
+    else {
+      extLoadAvailable = true;
+      
+      extLoadCapacity  = (uint32_t) sub7[1].toInt();
+      extLoadUnits     = (uint8_t) sub7[3].toInt(); //1 = g, 2 = N, 3 = kg
+    }
+    
+    materialType     = fields[8].charAt(0);
+    testType         = fields[9].charAt(0);
+    
+    String sub10[3];
+    split(fields[10], '_', sub10, 3);
+    matLength        = (uint16_t) sub10[0].toInt();
+    matWidth         = (uint16_t) sub10[1].toInt();
+    matHeight        = (uint16_t) sub10[2].toInt();
+
+    if (fields[11].charAt(0) == MUX32_OPT_NA)
+      hasDelam       = false;
+    else
+      hasDelam       = true;
+    
+    sampleNumber     = (uint16_t) fields[12].toInt();
+    totalChannels    = (uint16_t) fields[13].toInt();
+
+    if(materialType == MWCNT || materialType == MXENE || materialType == CX_ALPHA){
+      String sub14[2];
+      split(fields[14], '_', sub14, 2);
+      totalColumns     = (uint16_t) sub14[0].toInt();
+      totalRows        = (uint16_t) sub14[1].toInt();
+    }
     
     return true;
     
-  } else if (m==MUX_OAX_STR && n==11) {
-    // Variation 3
+  } else if (m == MUX_FGR_BEND && n == 13) { // Variation 2
+    machineType      = m;
+
+    String cy = fields[4];
+    cy.trim();
+    
+    unsigned long tc = cy.toInt();
+    if (tc < 1UL || tc > 9999999UL) return false;
+
+    totalCycles = (uint32_t)tc;
+
+    // Motor Speed sub‐fields
+    String sub5[4];
+    split(fields[5], '_', sub5, 4);
+    
+    char sm = sub5[0].length() ? sub5[0].charAt(0) : MUX32_OPT_NA;
+    
+    if (sm == 'R') {
+      varSpeedAvailable = true;
+      
+      nominalRPM = sub5[2].toFloat();
+    } else if (sm == 'S') {
+      varSpeedAvailable = true;
+      
+      speedStart       = sub5[1].toFloat();
+      speedEnd         = sub5[2].toFloat();
+      speedStep        = sub5[3].toFloat();
+    } else
+      varSpeedAvailable = false;
+
+    // Angle sub‐fields
+    String sub6[4];
+    split(fields[6], '_', sub6, 4);
+    
+    char va = sub6[0].length() ? sub6[0].charAt(0) : MUX32_OPT_NA;
+    
+    if (va == 'A') {
+      varAngleAvailable = true;
+      
+      motorAngle = sub6[2].toFloat();
+    } else if (va == 'V') {
+      varAngleAvailable = true;
+      
+      angleStart       = sub6[1].toFloat();
+      angleEnd         = sub6[2].toFloat();
+      angleStep        = sub6[3].toFloat();
+    } else
+      varAngleAvailable = false;
+
+    // H_/N_ sub‐fields
+    String sub7[3];
+    split(fields[7], '_', sub7, 3);
+    char h7 = sub7[0].length() ? sub7[0].charAt(0) : MUX32_OPT_NA;
+    
+    if (h7 == MUX32_OPT_NA)
+      extLoadAvailable = false;
+    else {
+      extLoadAvailable = true;
+      
+      extLoadCapacity  = (uint32_t) sub7[1].toInt();
+      extLoadUnits     = (uint8_t) sub7[3].toInt(); //1 = g, 2 = N, 3 = kg
+    }
+    
+    materialType     = fields[8].charAt(0);
+    testType         = fields[9].charAt(0);
+        
+    String sub10[3];
+    split(fields[10], '_', sub10, 3);
+    matLength        = (uint16_t) sub10[0].toInt();
+    matWidth         = (uint16_t) sub10[1].toInt();
+    matHeight        = (uint16_t) sub10[2].toInt();
+
+    if (fields[11].charAt(0) == MUX32_OPT_NA)
+      hasDelam       = false;
+    else
+      hasDelam       = true;
+    
+    sampleNumber     = (uint16_t) fields[12].toInt();
+    totalChannels    = (uint16_t) fields[13].toInt();
+
+    if(materialType == MWCNT || materialType == MXENE || materialType == CX_ALPHA){
+      String sub14[2];
+      split(fields[14], '_', sub14, 2);
+      totalColumns     = (uint16_t) sub14[0].toInt();
+      totalRows        = (uint16_t) sub14[1].toInt();
+    }
+    
+    return true;
+    
+  } else if (m == MUX_OAX_STR && n == 11) { // Variation 3
     machineType      = m;
     totalCycles      = (uint32_t) fields[1].toInt();
     
@@ -509,13 +728,19 @@ bool parseConfig(const String &payload) {
     matLength        = (uint16_t) sub7[0].toInt();
     matWidth         = (uint16_t) sub7[1].toInt();
     matHeight        = (uint16_t) sub7[2].toInt();
-    hasDelam         = fields[7].charAt(0);
+    
+    if (fields[7].charAt(0) == MUX32_OPT_NA)
+      hasDelam       = false;
+    else
+      hasDelam       = true;
+    
     sampleNumber     = (uint16_t) fields[8].toInt();
     
     String sub9[2];
     split(fields[9], '_', sub9, 2);
     totalColumns     = (uint16_t) sub9[0].toInt();
     totalRows        = (uint16_t) sub9[1].toInt();
+    
     totalChannels    = (uint16_t) fields[10].toInt();
     
     return true;
@@ -550,8 +775,8 @@ void setup() {
   pinMode(MC_CS, OUTPUT);
   digitalWrite(MC_CS, HIGH);
   
-  pinMode(SD_CS, OUTPUT);
-  digitalWrite(SD_CS, HIGH);
+  //pinMode(SD_CS, OUTPUT);
+  //digitalWrite(SD_CS, HIGH);
 
   delay(300);
 
@@ -575,25 +800,12 @@ void setup() {
     else
       break;
   }
-  
-  /* // ADS1220 Init
-  if(!ads.init())
-    Serial.println(ADS1220_ERROR_INIT);
-  else {
-    // The voltages to be measured need to be between negative VREF + 0.2 V and positive
-    // VREF -0.2 V if PGA is enabled. For this example I disable PGA, to be on the safe side.
-     
-    // ads.bypassPGA(true);
-    ads.setAvddAvssAsVrefAndCalibrate();
-    ads.setCompareChannels(ADS1220_MUX_1_2);
-  }*/
 
   // microSD Init
-  if (!SD.begin(SD_CS)) {
-    isSDins = false;
+  isSDins = SD.begin(SD_CS);
+  
+  if (!isSDins)
     Serial.println(SDCARD_WARNING);
-  } else
-    isSDins = true;
   
   // MCP23S17 Init
   if (!mcp.begin_SPI(MC_CS)) {
@@ -604,9 +816,10 @@ void setup() {
   }
   
   // bq25155 Init
-  if (!charger.begin(BQ_CHEN, BQ_INT, BQ_LPM)) {
+  if (!charger.begin(BQ_CHEN, BQ_INT, BQ_LPM))
     Serial.println(bq25155_ERROR_INIT);
-  } else {
+  else{
+    charger.DisableRST14sWD();
     charger.setPGasGPOD();
     charger.DisablePG();
   }
@@ -657,6 +870,18 @@ void setup() {
     if(lastSPS < 7 || lastSPS > 100)
       Serial.println(HX711_ERROR_INIT);
   }
+
+  /* // ADS1220 Init
+  if(!ads.init())
+    Serial.println(ADS1220_ERROR_INIT);
+  else {
+    // The voltages to be measured need to be between negative VREF + 0.2 V and positive
+    // VREF -0.2 V if PGA is enabled. For this example I disable PGA, to be on the safe side.
+     
+    // ads.bypassPGA(true);
+    ads.setAvddAvssAsVrefAndCalibrate();
+    ads.setCompareChannels(ADS1220_MUX_1_2);
+  }*/
   
   analogReadResolution(ADC_bits);
 }
@@ -666,33 +891,32 @@ void loop() {
     String in = Serial.readStringUntil('\n');
     in.trim();
     if (in.length() > 0) {
-      // Ping request
       if (in.length() == 1 && in.charAt(0) == MUX32_ALIVE) {
+        // Ping request
         Serial.println(MUX32_SUCCESS);
 
-      } else if (in.equalsIgnoreCase(MUX32_CHEN)) {
+      } else if (in.equalsIgnoreCase(MUX32_CH_EN)) {
         // Charge enable
         if (charger.initCHG(
           BAT_VOLTAGE_mV,   // Target charge voltage in mV
-          true,     // Enable fast charging
+          true,             // Enable fast charging?
           CHG_CURRENT_uA,   // Charge current in uA
           PCHG_CURRENT_uA,  // Precharge current in uA
           INPT_CURRENT_mA,  // Input current limit in mA
           SAFETY_TIMER      // Safety timer in tenths of an hour (e.g., 15 = 1.5h, 30 = 3h)
         )) {
-          charger.EnablePG();
-          is_CHG_Set = true;
+          charger.DisableRST14sWD();
+          charger.DisablePG();
 
           Serial.println(MUX32_SUCCESS);
         } else {
-          is_CHG_Set = false;
+          charger.DisableCharge();
+          charger.EnablePG();
           Serial.println(bq25155_ERROR_INIT);
         }
 
-      
-      } else if (in.equalsIgnoreCase(MUX32_CHDIS)) {
+      } else if (in.equalsIgnoreCase(MUX32_CH_DIS)) {
         // Charge disabled
-        is_CHG_Set = false;
         if (charger.DisableCharge()) {
           charger.DisablePG();
           Serial.println(MUX32_SUCCESS);
@@ -700,26 +924,70 @@ void loop() {
           Serial.println(bq25155_ERROR_INIT);
         }
 
+      } else if (in.equalsIgnoreCase(MUX32_CH_VBAT)) {
+        // Vbat only
+        VBAT = charger.readVBAT(1);
+        Serial.println(VBAT);
+        
+      } else if (in.equalsIgnoreCase(MUX32_CH_STAT)) {
+        // Charger status
+        Serial.print("ChSet:"+String(is_CHG_Set)+",");
+        Serial.print("ChDn:"+String(is_CHG_DONE)+",");
+        Serial.print("VinOK:"+String(is_Vin_PG)+",");
+        Serial.print("PGEn:"+String(is_PG_En)+",");
+        Serial.print("INVo:"+String(INVo)+",");
+        Serial.print("INuA:"+String(INCu)+",");
+        Serial.print("BatV:"+String(VBAT)+",");
+        Serial.println("CHuA:"+String(ICHG));
+        
       } else switch (currentMode) {
-        case MODE_SETUP:
-          if (in==MUX32_A || in==MUX32_B || in==MUX08_A || in==MUX08_B) {
+        case MODE_IDLE:
+          if (in.length() == 1 && in.charAt(0) == MUX32_SETUP) {
             Serial.println(MUX32_SUCCESS);
             currentMode = MODE_CONFIG;
-          } else {
+            lastDataTime = millis();
+          } else
             Serial.println(MUX32_INVALID_COMMAND);
-          }
           break;
 
         case MODE_CONFIG:
-          if (parseConfig(in)) {
+          if (in.length() == 3 && in.equalsIgnoreCase(MUX32_END_OF_TEST)) {
+            // End test command
+            currentMode = MODE_IDLE;
             Serial.println(MUX32_SUCCESS);
-            currentMode = MODE_DATAREQ;
-            lastDataTime = millis();
           } else {
-            Serial.println(MUX32_INVALID_PAYLOAD);
+            if (parseConfig(in)) {
+              if (totalChannels == 1) {
+                channelHeader = F("Resistance (6001)");
+              }else if (totalChannels == 8) {
+                channelHeader = F("1001 <R1> (OHM), 1002 <R2> (OHM), 1003 <R3> (OHM), 1004 <R4> (OHM), "
+                                  "1006 <C1> (OHM), 1007 <C2> (OHM), 1008 <C3> (OHM), 1009 <C4> (OHM)");
+              }else if (totalChannels == 10) {
+                channelHeader = F("1001 <R1> (OHM), 1002 <R2> (OHM), 1003 <R3> (OHM), "
+                                  "1004 <R4> (OHM), 1005 <R5> (OHM), "
+                                  "1006 <C1> (OHM), 1007 <C2> (OHM), 1008 <C3> (OHM), "
+                                  "1009 <C4> (OHM), 1010 <C5> (OHM)");
+              }else if (totalChannels == 21) {
+                channelHeader = F("1-1p (6001),1-3p (6002),2-4p (6003),3-1p (6004),3-5p (6005),"
+                                  "4-2p (6006),4-6p (6007),5-3p (6008),5-7p (6009),6-4p (6010),"
+                                  "6-8p (6011),7-5p (6012),7-9p (6013),8-6p (6014),8-10p (6015),"
+                                  "9-7p (6016),9-11p (6017),10-8p (6018),10-12p (6019),"
+                                  "11-9p (6020),11-13p (6021),12-10p (6022),12-14p (6023),"
+                                  "13-11p (6024),13-15p (6025),14-12p (6026),14-16p (6027),"
+                                  "15-13p (6028),15-17p (6029),16-14p (6030),16-18p (6031),"
+                                  "17-15p (6032),17-19p (6033),18-16p (6034),18-20p (6035),"
+                                  "19-17p (6036),19-21p (6037),20-18p (6038),21-19p (6039),21-21p (6040)");
+              }//else
+              //  Serial.println(MUX32_INVALID_PAYLOAD);
+              Serial.print(F("5001 <LOAD> (VDC),5021 <DISP> (VDC),"));
+              Serial.println(channelHeader);
+            
+              currentMode = MODE_DATAREQ;
+              lastDataTime = millis();
+            } else
+              Serial.println(MUX32_INVALID_PAYLOAD);
           }
           break;
-
         case MODE_DATAREQ:
           if (tolower(in.charAt(0)) == MUX32_PAUSE_TEST) {
             // pause/resume test
@@ -742,20 +1010,42 @@ void loop() {
             }
           } else if (in.equalsIgnoreCase(MUX32_END_OF_TEST)) {
             // End test command
-            currentMode = MODE_SETUP;
+            currentMode = MODE_IDLE;
             Serial.println(MUX32_SUCCESS);
           }
           break;
       }
     }
   }
+  
+  // Update sensor variables
+  unsigned long nowsense = millis();
+  if (nowsense - lastDataTime >= sensInterval) {
+    is_CHG_Set = charger.isChargeEnabled();
+    is_CHG_DONE = charger.is_CHARGE_DONE();
+    is_Vin_PG = charger.is_VIN_PGOOD();
+    is_PG_En = charger.isPGEnabled();
+    INVo = charger.readVIN(1);
+    INCu = charger.readIIN(2);
+    VBAT = charger.readVBAT(1);
+    ICHG = charger.readICHG(2);
+
+    readBME(TempEn, RHumEn, PresEn, GasEn);
+
+    if (LUXEn)
+      readLTR(LUXType == 2 ? true : false);
+
+    readHX7();
+    
+    lastSensTime = nowsense;
+  }
 
   // Data burst (if auto send config)
-  if (currentMode==MODE_DATAREQ && !paused) {
-    unsigned long now = millis();
-    if (now - lastDataTime >= dataInterval) {
-      lastDataTime = now;
-      sendData();
+  if (currentMode == MODE_DATAREQ && !paused) {
+    unsigned long nowdata = millis();
+    if (nowdata - lastDataTime >= dataInterval) {
+      // sendData(); // disabled for now
+      lastDataTime = nowdata;
     }
   }
 }
@@ -940,14 +1230,13 @@ void readADC(uint32_t deluSecs){
 //----------------------------------------------------------------------------------------------------------------------
 
 // Ambient sensor read
-bool readBME() {
-  // perform data reading:
-  if (bme.performReading()){
+bool readBME(bool temp, bool rhum, bool atmpr, bool gas) {
+  if (bme.performReading()) {
     
-    BME_temp = bme.temperature;
-    BME_humr = bme.humidity;
-    BME_press = bme.pressure; // in Pa, divide by 100 to hPa
-    BME_gas = bme.gas_resistance; // in Ohms, divide by 1000 to kOhms
+    BME_temp = (temp ? bme.temperature : 0.0); // in C
+    BME_humr = (rhum ? bme.humidity : 0.0); // in rH%
+    BME_press = (atmpr ? bme.pressure : 0.0); // in Pa, divide by 100 to hPa
+    BME_gas = (gas ? bme.gas_resistance : 0.0); // in Ohms, divide by 1000 to kOhms
     
     return true;
   } else
@@ -1069,9 +1358,6 @@ void sendData() {
       Serial.print(","); // Add a comma between vals
   }
   */
-  readHX7();
-  readBME();
-  readLTR(0);
   
   Serial.print(","+String(HX_weight));
   
