@@ -4,9 +4,9 @@
  *                Multiplexing, Reading, Processing
  *                and saving data coming from a 
  *                21p CNT_GFW sensor
- * @version       0.5
+ * @version       1.0
  * @creation date 2025-07-07
- * @updated date  2025-10-07
+ * @updated date  2025-10-15
  * @author        by jul10199555
  * @copyright     Copyright (c) 2025
  * 
@@ -25,9 +25,11 @@
 #include <Adafruit_BME680.h> // Click to install library: http://librarymanager/All#Adafruit_BME680
 #include <UVlight_LTR390.h> // Click here to get the library: http://librarymanager/All#RAK12019_LTR390
 
-#include <SD.h>
-
 #include <HX711_ADC.h>
+
+#include <TimeLib.h>
+
+#include <SD.h>
 
 //----------------------------------------------------------------------------------------------------------------------
 // System Pins
@@ -42,8 +44,26 @@
 #define LED_GREEN   PWR_LED
 #define LED_ORANGE  STAT_LED // LED_BLUE
 
-#define GLED_BRIGHTNESS   18
-#define OLED_BRIGHTNESS   72
+#define GNLED_BRIGHTNESS   18
+#define OGLED_BRIGHTNESS   72
+
+//----------------------------------------------------------------------------------------------------------------------
+// Date & Time parameters
+//----------------------------------------------------------------------------------------------------------------------
+
+// Default if microSD has not time yet.
+int INIT_Y  = 2025;
+int INIT_MO = 10;
+int INIT_D  = 15;
+int INIT_H  = 3;
+int INIT_MI = 0;
+int INIT_S  = 0;
+
+uint32_t save_dtt_sd = 30;
+
+int Y, Mo, D, H, Mi, S;
+uint16_t lastSavedYMD = 0; // YYYY*10000 + MM*100 + DD
+time_t lastPrint = 0;
 
 //----------------------------------------------------------------------------------------------------------------------
 // nRF ADC parameters
@@ -135,8 +155,13 @@ float ADSVRef_V = 0.0, ADSReading_mV = 0.0, ADSTemp = 25.0;
 #define SD_CS       24
 
 File DataSD;
+File DTTSettings;
+
+const char* setts_file = "/settings.txt";
+static uint32_t g_lastSdSaveMs   = 0;
 
 bool isSDins = false, is1stIt = true;
+
 uint8_t fid = 1;
 uint32_t uSD_row = 1;
 
@@ -313,6 +338,7 @@ Mode currentMode = MODE_IDLE;
 #define MUX32_CH_DIS          "cd"
 #define MUX32_CH_VBAT         "vb"
 #define MUX32_CH_STAT         "cs"
+#define MUX32_DT_STAT         "dt"
 #define MUX32_TARE_HX         't'
 
 // OnTest Commands
@@ -336,9 +362,11 @@ Mode currentMode = MODE_IDLE;
 #define HX711_ERROR_INIT      (0x08)
 
 // Sensors & Memory Warnings
-#define SDCARD_WARNING        (0x09)
-#define BME_WARNING           (0x0A)
-#define LTR_WARNING           (0x0B)
+#define BME_WARNING           (0x09)
+#define LTR_WARNING           (0x0A)
+
+#define DTT_WARNING           (0x0E)
+#define SDCARD_WARNING        (0x0F)
 
 //----------------------------------------------------------------------------------------------------------------------
 // System State Variables
@@ -784,10 +812,10 @@ void setup() {
   digitalWrite(HX_DRT, set80SPS ? HIGH : LOW);
   
   pinMode(LED_GREEN, OUTPUT);
-  analogWrite(LED_GREEN, GLED_BRIGHTNESS);
+  analogWrite(LED_GREEN, GNLED_BRIGHTNESS);
   
   pinMode(LED_ORANGE, OUTPUT);
-  analogWrite(LED_ORANGE, OLED_BRIGHTNESS);
+  analogWrite(LED_ORANGE, OGLED_BRIGHTNESS);
   
   // RAK WEIRD RUTINE TO AVOID CRASHING THE AT COMMANDS MCUs
   time_t timeout = millis();
@@ -801,12 +829,9 @@ void setup() {
       break;
   }
 
-  // microSD Init
-  isSDins = SD.begin(SD_CS);
-  
-  if (!isSDins)
-    Serial.println(SDCARD_WARNING);
-  
+  // Try init microSD and restore RTC
+  restoreRTC();
+
   // MCP23S17 Init
   if (!mcp.begin_SPI(MC_CS)) {
     Serial.println(MCP23_ERROR_INIT);
@@ -887,6 +912,30 @@ void setup() {
 }
 
 void loop() {
+
+  // Update sensor variables
+  unsigned long nowsense = millis();
+  if (nowsense - lastDataTime >= sensInterval) {
+    is_CHG_Set = charger.isChargeEnabled();
+    is_CHG_DONE = charger.is_CHARGE_DONE();
+    is_Vin_PG = charger.is_VIN_PGOOD();
+    is_PG_En = charger.isPGEnabled();
+
+    INVo = charger.readVIN(1);
+    INCu = charger.readIIN(2);
+    VBAT = charger.readVBAT(1);
+    ICHG = charger.readICHG(2);
+
+    readBME(TempEn, RHumEn, PresEn, GasEn);
+
+    if (LUXEn)
+      readLTR(LUXType == 2 ? true : false);
+
+    readHX7();
+    
+    lastSensTime = nowsense;
+  }
+
   if (Serial.available()) {
     String in = Serial.readStringUntil('\n');
     in.trim();
@@ -894,6 +943,19 @@ void loop() {
       if (in.length() == 1 && in.charAt(0) == MUX32_ALIVE) {
         // Ping request
         Serial.println(MUX32_SUCCESS);
+
+      } else if (sscanf(in.c_str(), "%d_%d_%d_%d_%d_%d", &Y, &Mo, &D, &H, &Mi, &S) == 6) {
+        setTime(H, Mi, S, D, Mo, Y);
+
+        Serial.print("RTC set to: ");
+        Serial.println(fmtTS(now()));
+
+        // Save to SD
+        Serial.println(uSD_DTT_update());
+
+      } else if (in.equalsIgnoreCase(MUX32_DT_STAT)) {
+        // DTT request
+        Serial.println(fmtTS(now()));
 
       } else if (in.equalsIgnoreCase(MUX32_CH_EN)) {
         // Charge enable
@@ -1017,28 +1079,6 @@ void loop() {
       }
     }
   }
-  
-  // Update sensor variables
-  unsigned long nowsense = millis();
-  if (nowsense - lastDataTime >= sensInterval) {
-    is_CHG_Set = charger.isChargeEnabled();
-    is_CHG_DONE = charger.is_CHARGE_DONE();
-    is_Vin_PG = charger.is_VIN_PGOOD();
-    is_PG_En = charger.isPGEnabled();
-    INVo = charger.readVIN(1);
-    INCu = charger.readIIN(2);
-    VBAT = charger.readVBAT(1);
-    ICHG = charger.readICHG(2);
-
-    readBME(TempEn, RHumEn, PresEn, GasEn);
-
-    if (LUXEn)
-      readLTR(LUXType == 2 ? true : false);
-
-    readHX7();
-    
-    lastSensTime = nowsense;
-  }
 
   // Data burst (if auto send config)
   if (currentMode == MODE_DATAREQ && !paused) {
@@ -1048,6 +1088,10 @@ void loop() {
       lastDataTime = nowdata;
     }
   }
+
+  // Autosave Date&Time
+  if (sdDueToSave())
+    int dttsaved = uSD_DTT_update();
 }
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -1230,7 +1274,7 @@ void readADC(uint32_t deluSecs){
 //----------------------------------------------------------------------------------------------------------------------
 
 // Ambient sensor read
-bool readBME(bool temp, bool rhum, bool atmpr, bool gas) {
+static bool readBME(bool temp, bool rhum, bool atmpr, bool gas) {
   if (bme.performReading()) {
     
     BME_temp = (temp ? bme.temperature : 0.0); // in C
@@ -1244,7 +1288,7 @@ bool readBME(bool temp, bool rhum, bool atmpr, bool gas) {
 }
 
 // Lux sensor read
-bool readLTR(bool UVI) {
+static bool readLTR(bool UVI) {
   
   // if set LTR390_MODE_UVS, get UV light data.
   // if set LTR390_MODE_ALS, get ambient light data
@@ -1269,7 +1313,7 @@ bool readLTR(bool UVI) {
 }
 
 // Loadcell ADC read
-bool readHX7() {
+static bool readHX7() {
   // check for new data/start next conversion:
   if (LoadCell.update()) {
     HX_weight = LoadCell.getData();
@@ -1281,11 +1325,149 @@ bool readHX7() {
 }
 
 // Loadcell tare check
-bool taredLoadcell() {
+static bool taredLoadcell() {
   if(!LoadCell.getTareStatus())
     return true;
   else
     return false;
+}
+
+static void restoreRTC() {
+  if (SD.begin(SD_CS)) {
+    // Check for file first
+    if (SD.exists(setts_file)) {
+      // Load from SD and set RTC
+      uint32_t e = 0;
+      if (sdLoadEpoch(e) && e > 1000000000UL) {
+        setTime(e);
+        lastSavedYMD = packYMD(year(), month(), day());
+      } else
+        defaultRTC();
+    } else {
+      // Use the initial defaults
+      tmElements_t tm;
+      tm.Year   = CalendarYrToTm(INIT_Y);
+      tm.Month  = INIT_MO;
+      tm.Day    = INIT_D;
+      tm.Hour   = INIT_H;
+      tm.Minute = INIT_MI;
+      tm.Second = INIT_S;
+
+      time_t t0 = makeTime(tm);
+
+      defaultRTC();
+
+      // Try to create the file
+      if (!sdSaveEpoch(t0))
+        Serial.println(DTT_WARNING);
+    }
+
+    SD.end();
+
+  } else
+    defaultRTC();
+}
+
+static void defaultRTC() {
+  // Just set the RTC from user defaults
+  setTime(INIT_H, INIT_MI, INIT_S, INIT_D, INIT_MO, INIT_Y);
+  lastSavedYMD = packYMD(INIT_Y, INIT_MO, INIT_D);
+}
+
+static uint8_t uSD_DTT_update() {
+  if (SD.begin(SD_CS)) {
+    if (sdSaveEpoch(now())) {
+      SD.end();
+
+      return MUX32_SUCCESS;
+    } else {
+      SD.end();
+
+      return DTT_WARNING;
+    }
+  } else
+    return SDCARD_WARNING;
+}
+
+static bool sdLoadEpoch(uint32_t &outEpoch) {
+  DTTSettings = SD.open(setts_file, FILE_READ);
+  if (!DTTSettings) return false;
+
+  // Read small file into buffer
+  char buf[96] = {0};
+  
+  size_t n = DTTSettings.readBytes(buf, sizeof(buf) - 1);
+  DTTSettings.close();
+  
+  if (n == 0) return false;
+
+  // UNIX= first
+  uint32_t e = 0;
+  if (sscanf(buf, "EPOCH=%lu", &e) == 1 && e > 1000000000UL) {
+    outEpoch = e;
+    return true;
+  }
+
+  // HUMAN=YYYY_MM_DD_HH_MM_SS
+  int Y,Mo,D,H,Mi,S;
+  if (strstr(buf, "HUMAN=") && sscanf(buf, "HUMAN=%d_%d_%d_%d_%d_%d", &Y,&Mo,&D,&H,&Mi,&S) == 6) {
+    tmElements_t tm;
+    tm.Year = CalendarYrToTm(Y);
+    tm.Month = Mo;
+    tm.Day = D;
+    tm.Hour = H;
+    tm.Minute = Mi;
+    tm.Second = S;
+    outEpoch = makeTime(tm);
+    return true;
+  }
+  
+  return false;
+}
+
+static bool sdSaveEpoch(time_t t) {
+  // Open for write (will overwrite existing file)
+  DTTSettings = SD.open(setts_file, FILE_WRITE);
+  if (!DTTSettings) return false;
+
+  // Since there is not support truncate(), we must remove & recreate
+  DTTSettings.close();
+  SD.remove(setts_file);
+  
+  DTTSettings = SD.open(setts_file, FILE_WRITE);
+  if (!DTTSettings) return false;
+
+  // Write both machine- and human-friendly versions
+  DTTSettings.print("EPOCH=");
+  DTTSettings.println((uint32_t)t);
+  DTTSettings.print("HUMAN=");
+  DTTSettings.println(fmtTS(t));
+
+  DTTSettings.flush();
+  DTTSettings.close();
+  
+  lastSavedYMD = packYMD(Y,Mo,D);
+
+  g_lastSdSaveMs = millis();
+  return true;  // always true if we reached here
+}
+
+// Save guard for periodic SD writes
+static inline bool sdDueToSave() {
+  const uint32_t periodMs = (uint32_t)save_dtt_sd * 60000UL;
+  return (millis() - g_lastSdSaveMs) >= periodMs;
+}
+
+// pack Y/M/D into a single int for easy comparison
+static uint16_t packYMD(int y, int m, int d) {
+  return uint16_t(y % 100) * 10000 + uint16_t(m) * 100 + uint16_t(d);
+}
+
+// format epoch as "YYYY_MM_DD_HH_MM_SS" 
+static String fmtTS(time_t t) {
+  char b[20];
+  snprintf(b, sizeof(b), "%04d_%02d_%02d_%02d_%02d_%02d", year(t), month(t), day(t), hour(t), minute(t), second(t));
+  return String(b);
 }
 
 bool save2SD(){
