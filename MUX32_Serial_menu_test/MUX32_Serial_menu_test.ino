@@ -1,12 +1,13 @@
 /*
- * @brief         MUX32 Serial Dummy
+ * @brief         MUX32 real time SHM
  * @note          Implements a low power system for 
  *                Multiplexing, Reading, Processing
  *                and saving data coming from a 
- *                21p CNT_GFW sensor
- * @version       1.0
+ *                variety of carbon sensors up to 
+ *                32-channels.
+ * @version       1.1
  * @creation date 2025-07-07
- * @updated date  2025-10-15
+ * @updated date  2025-10-19
  * @author        by jul10199555
  * @copyright     Copyright (c) 2025
  * 
@@ -123,18 +124,25 @@ bool M2A0, M2A1, M2A2, M2A3, M2A4;
 uint8_t portA = 0, portB = 0;
 uint16_t gpioAB = 0, MCP_delay = 1;
 
-// ##-GFW Sensors Channels
-#define ADS_READINGS 40
+// GFW Sensors Channels
+#define MAX_CHANNELS 32
+#define GFW_READINGS 40
 
-// Array of the 40 mappings
+uint8_t totalChannels = 0;
+
+// Struct for dual MUX
 struct MuxPair { uint8_t ch1, ch2; };
-const MuxPair GFW_chs[ADS_READINGS] = {
+
+// Array of mappings for the XX-GFW sensors
+const MuxPair GFW_chs[GFW_READINGS] = {
   {1, 1},  {1, 3},  {2, 4},  {3, 1},  {3, 5},  {4, 2},  {4, 6},  {5, 3},
   {5, 7},  {6, 4},  {6, 8},  {7, 5},  {7, 9},  {8, 6},  {8,10},  {9, 7},
   {9,11},  {10, 8}, {10,12}, {11, 9}, {11,13}, {12,10}, {12,14}, {13,11},
   {13,15}, {14,12}, {14,16}, {15,13}, {15,17}, {16,14}, {16,18}, {17,15},
   {17,19}, {18,16}, {18,20}, {19,17}, {19,21}, {20,18}, {21,19}, {21,21}
 };
+
+String channelHeader;
 
 //----------------------------------------------------------------------------------------------------------------------
 // ADS1220 (IC7)
@@ -145,7 +153,7 @@ const MuxPair GFW_chs[ADS_READINGS] = {
 //ADS1220_WE ads = ADS1220_WE(AD_CS, AD_DRDY);
 
 // Store readings in microvolts as 32-bit integers
-int32_t readings_uV[ADS_READINGS];
+int32_t readings_uV[GFW_READINGS];
 
 float ADSVRef_V = 0.0, ADSReading_mV = 0.0, ADSTemp = 25.0;
 
@@ -160,6 +168,8 @@ File DTTSettings;
 const char* setts_file = "/settings.txt";
 static uint32_t g_lastSdSaveMs   = 0;
 
+bool enuSDWrite = true; // false -> disable microSD writing, true -> enable microSD writing
+
 bool isSDins = false, is1stIt = true;
 
 uint8_t fid = 1;
@@ -170,11 +180,11 @@ uint32_t uSD_row = 1;
 // GND - 3V3_2 - 3VO - DP_CS - DP_RST - DP_DC - SCK - MOSI
 // GND - 3V3_2 -  NC -  CS3  - DP_RST - MISO  - SCK - MOSI
 //----------------------------------------------------------------------------------------------------------------------
-#define CS_3        19
-#define DP_CS       26
-#define DP_DC       28 // AIN4
-#define OLED_RESET -1
-#define SCREEN_WIDTH 128
+#define CS_3          19
+#define DP_CS         26
+#define DP_DC         28 // AIN4
+#define OLED_RESET    -1
+#define SCREEN_WIDTH  128
 #define SCREEN_HEIGHT 128
 
 //----------------------------------------------------------------------------------------------------------------------
@@ -193,20 +203,20 @@ uint32_t uSD_row = 1;
 // Drive CE high to disable charge when VIN is present.
 // CE is pulled low internally with 900-kΩ resistor.
 // CE has no effect when VIN is not present.
-#define BQ_CHEN     2  // AIN0
+#define BQ_CHEN   2  // AIN0
 
 // Interruption (INT) pin.
 // INT is an open-drain output that signals fault interrupts. 
 // When a fault occurs, a 128-µs pulse is sent out as an interrupt for the host.
 // INT is enabled/disabled using the MASK_INT bit in the control register.
-#define BQ_INT  5  // AIN3 (Monitoreo de batería o Fault INT de BMS)
+#define BQ_INT    5  // AIN3 (Monitoreo de batería o Fault INT de BMS)
 
 // Low Power Mode (LPM) Enable pin.
 // Drive this pin low to set the device in low power mode when powered by the battery. 
 // This pin must be driven high to allow I2C communication when VIN is not present.
 // LP is pulled low internally with 900-kΩ resistor.
 // This pin has no effect when VIN is present
-#define BQ_LPM      20 // HIGH to allow I2C communication when VIN is not present
+#define BQ_LPM    20 // HIGH to allow I2C communication when VIN is not present
 
 bq25155 charger;
 
@@ -231,8 +241,8 @@ uint32_t INCu = 0, ICHG = 0;
 #define MAX_RESISTANCE_OHMS 1000000  // 1 MΩ
 #define MAX_POT_STEPS 255.0
 
-AD5242 POT1(0x2C);  //  AD1->GND AD0->GND
-AD5242 POT2(0x2E);  //  AD1->VCC AD0->GND
+AD5242 POT1(0x2C);  // AD1->GND AD0->GND
+AD5242 POT2(0x2E);  // AD1->VCC AD0->GND
 
 //----------------------------------------------------------------------------------------------------------------------
 // BME680 (IC13)
@@ -243,6 +253,20 @@ uint8_t BME_ADDR = 0x76;
 
 Adafruit_BME680 bme;
 
+bool bmeSet = false;
+bool bmeEnabled = false;
+
+bool TempEn = false;
+uint8_t TempUnits = 1; // 1 = C, 2 = F
+
+bool RHumEn = false;
+
+bool PresEn = false;
+uint8_t PresUnits = 1; // 1 = hPa, 2 = mBar, 3 = mmHg
+
+bool GasEn = false;
+uint8_t GasUnits = 1; // 1 = Kohms, 2 = TVoC
+
 uint32_t BME_press = 0, BME_gas = 0;
 float BME_temp = 0.0, BME_humr = 0.0;
 
@@ -251,6 +275,13 @@ float BME_temp = 0.0, BME_humr = 0.0;
 //----------------------------------------------------------------------------------------------------------------------
 // LTR390U 0X53 FIXED
 UVlight_LTR390 ltr = UVlight_LTR390();
+
+bool LTRSet = false;
+bool LTREnabled = false;
+
+bool LUXEn = false;
+uint8_t LUXType = 1; // 1 = ALS, 2 = UVS
+uint8_t LUXBits = 16;
 
 uint32_t LTR_XXS = 0;
 float LTR_IDX = 0.0;
@@ -264,51 +295,34 @@ float LTR_IDX = 0.0;
 
 HX711_ADC LoadCell(HX_DAT, HX_SCK); // Constructor
 
-unsigned long t = 0;
+bool extLoadAvailable = false;
+uint32_t HX_Cell_Capacity = 0; // Load Cell Capacity in g
+uint8_t extLoadUnits = 0; // 1 = g, 2 = N, 3 = kg, 4 = kN
+
+bool HX_iniTare = true; // set to false if tare is not required at begin
+bool set80SPS = false; // DR-> false=10Hz, true=80Hz
+
 unsigned long HX_stabilize_t = 1000; // tare preciscion can be improved by adding a few seconds of stabilizing time
 const int serialPrintInterval = 250; // increase value to slow down serial print activity
-
-bool HX_iniTare = true; //set to false if not tare is required at beginning
-bool set80SPS = false; // DR-> false=10Hz, true=80Hz
 
 uint32_t settTime = 0;
 float lastSPS = 0.0, convTime = 0.0;
 float HX_weight = 0.0, HX_load = 0.0; // Store vals
 
-uint16_t HX_Cell_Capacity = 2000; // Load Cell Capacity in g
 float calibrationValue = 1104.10; // start calibration value
-
-// Shimadzu ADC Readings
-#define SHMDZ_LOAD  4 // AIN2 (No usar si se mide carga con shimadzu)
-#define SHMDZ_DISP  31 // AIN7 (No usar si se mide carga con shimadzu)
-
-// Shimadzu resistors
-uint32_t VD_PU = 100000, VD_PD = 150000;
-
-//----------------------------------------------------------------------------------------------------------------------
-// App Timings
-//----------------------------------------------------------------------------------------------------------------------
-const unsigned long DEFAULT_DATA_INTERVAL = 1000;  // ms
 
 //----------------------------------------------------------------------------------------------------------------------
 // System Command Codes
 //----------------------------------------------------------------------------------------------------------------------
-// Board Menu/Modes
+
+// Board Menu commands
 #define MUX32_INIT_SETTINGS   (0x01)
 #define MUX32_SEND_DATA       (0x02)
 #define MUX32_CONFIG_DATA     (0x03)
 
 #define MUX32_OPT_NA          'N'
 
-#define MUX_PAY_DEL           ','
-
-enum Mode {
-  MODE_IDLE,
-  MODE_CONFIG,
-  MODE_DATAREQ
-};
-
-Mode currentMode = MODE_IDLE;
+#define MUX_PLD_DEL           ','
 
 // Board Models
 #define MUX08_A               "8"
@@ -316,20 +330,6 @@ Mode currentMode = MODE_IDLE;
 
 #define MUX32_A               "32"
 #define MUX32_B               "MUX32"
-
-// Machines
-#define MUX_SHIMADZU          'S'
-#define MUX_MTS               'T'
-#define MUX_MINI_SMDZ         'M'
-#define MUX_FGR_BEND          'F'
-#define MUX_OAX_STR           'O'
-
-// Materials
-#define CNT_GFW               'C'
-#define GS_GFW                'G'
-#define MWCNT                 'M'
-#define MXENE                 'X'
-#define CX_ALPHA              'A'
 
 // Global Commands
 #define MUX32_ALIVE           '0'
@@ -346,12 +346,16 @@ Mode currentMode = MODE_IDLE;
 #define MUX32_PAUSE_TEST      'p'
 #define MUX32_END_OF_TEST     "end"
 
-// Board Errors Codes
+//----------------------------------------------------------------------------------------------------------------------
+// System Errors & Warning Codes
+//----------------------------------------------------------------------------------------------------------------------
+
+// Board
 #define MUX32_SUCCESS         (0x00)
 #define MUX32_INVALID_COMMAND (0x01)
 #define MUX32_INVALID_PAYLOAD (0x02)
 
-// Peripheral Errors
+// Peripherals
 #define bq25155_ERROR_INIT    (0x03)
 #define ADS1220_ERROR_INIT    (0x04)
 
@@ -369,97 +373,411 @@ Mode currentMode = MODE_IDLE;
 #define SDCARD_WARNING        (0x0F)
 
 //----------------------------------------------------------------------------------------------------------------------
-// System State Variables
+// System Test settings
 //----------------------------------------------------------------------------------------------------------------------
-bool paused = false;
-unsigned long dataInterval = DEFAULT_DATA_INTERVAL;
-unsigned long sensInterval = DEFAULT_DATA_INTERVAL;
-unsigned long lastDataTime = 0, lastSensTime = 0;
 
-// --- CONFIGURATION VARIABLES (largest superset needed) ---
+// Board status mode
+enum Mode {
+  MODE_IDLE,
+  MODE_CONFIG,
+  MODE_DATAREQ
+};
 
-uint8_t MUXBoard = 0;
-
-// Sensors configuration
-// BME
-bool TempEn = false;
-//1 = C
-//2 = F
-uint8_t TempUnits = 1;
-bool RHumEn = false;
-bool PresEn = false;
-//1 = hPa
-//2 = mBar
-//3 = mmHg
-uint8_t PresUnits = 1;
-bool GasEn = false;
-//1 = Kohms
-//2 = TVoC
-uint8_t GasUnits = 1;
-// LTR
-bool LUXEn = false;
-//1 = ALS
-//2 = UVS
-uint8_t LUXType = 1;
-uint8_t LUXBits = 16;
+Mode currentMode = MODE_IDLE;
 
 // Test settings
-char machineType = 0;
+uint8_t MUXBoard = 0;
+char testType = 0;
 uint32_t totalCycles = 0;
-uint16_t nominalRPM = 0;
 
-// Variation 1 displacement
+bool paused = false;
+
+//----------------------------------------------------------------------------------------------------------------------
+// Machine Properties
+//----------------------------------------------------------------------------------------------------------------------
+
+// Machine type
+#define MUX_SHIMADZU          'S'
+#define MUX_MTS               'T'
+#define MUX_MINI_SMDZ         'M'
+#define MUX_FGR_BEND          'F'
+#define MUX_OAX_STR           'O'
+
+char machineType = 0;
+
+// Shimadzu ADC Readings
+#define SHMDZ_LOAD             4 // AIN2 (No usar si se mide carga con shimadzu)
+#define SHMDZ_DISP            31 // AIN7 (No usar si se mide carga con shimadzu)
+
+// Shimadzu resistors
+uint32_t VD_PU = 100000, VD_PD = 150000;
+
+// Big machine displacement measurements
 bool dispAvailable = false;
 uint8_t dispMaxVoltage = 0;
-uint16_t maxDistance = 0;
-//1 = mm
-//2 = cm
-//3 = in
+uint16_t maxDistance = 0; // 1 = mm, 2 = cm, 3 = in
 uint8_t distanceUnits = 1;
 
-// Variation 1 load
+// Big machine load measurements
 bool loadAvailable = false;
 uint8_t loadMaxVoltage = 0;
 uint32_t loadCapacity = 0;
-//1 = g
-//2 = N
-//3 = kg
-//4 = kN
-uint8_t loadUnits = 0;
+uint8_t loadUnits = 0; // 1 = g, 2 = N, 3 = kg, 4 = kN
 
-// Variation 1 external loadcell
-bool extLoadAvailable = false;
-uint32_t extLoadCapacity = 0;
-uint8_t extLoadUnits = 0;
-
-// Variation 2 variable speed
+// Prototype variable speed
 bool varSpeedAvailable = false;
+uint16_t nominalRPM = 0;
 float speedStart = 0, speedEnd = 0, speedStep = 0;
 
-// Variation 2 motor angle
-float motorAngle = 0;
+// Prototype motor angle
 bool varAngleAvailable = false;
+float motorAngle = 0;
 float angleStart = 0, angleEnd = 0, angleStep = 0;
 
-// Common material/test fields
-char materialType = 0;
-char testType = 0;
-uint16_t matLength = 0, matWidth = 0, matHeight = 0;
-bool hasDelam = false;
-uint16_t sampleNumber = 0;
-uint16_t totalColumns = 0, totalRows = 0;
-uint16_t totalChannels = 0;
-
-String channelHeader;
-
-// Variation 3 strain
+// Strain (calculation)
 uint32_t maxStrain = 0;
 uint8_t strainUnits = 0;
 
 //----------------------------------------------------------------------------------------------------------------------
-// System Helper Functions
+// Materials settings
 //----------------------------------------------------------------------------------------------------------------------
-// Split str by delimiter into arr[0..maxParts-1], return actual count
+
+// Materials
+#define CNT_GFW               'C'
+#define GS_GFW                'G'
+#define MWCNT                 'M'
+#define MXENE                 'X'
+#define CX_ALPHA              'A'
+
+char materialType = 0;
+uint16_t sampleNumber = 0;
+
+bool hasDelam = false;
+uint16_t matLength = 0, matWidth = 0, matHeight = 0;
+uint16_t totalColumns = 0, totalRows = 0;
+
+//----------------------------------------------------------------------------------------------------------------------
+// App Timings
+//----------------------------------------------------------------------------------------------------------------------
+
+const unsigned long DEFAULT_DATA_INTERVAL = 1000;  // ms
+
+unsigned long dataInterval = DEFAULT_DATA_INTERVAL;
+unsigned long sensInterval = DEFAULT_DATA_INTERVAL;
+
+unsigned long lastDataTime = 0, lastSensTime = 0;
+
+void setup() {
+  pinMode(EN_SNS, OUTPUT);
+  digitalWrite(EN_SNS, LOW); // Apaga VCNT
+  
+  pinMode(EN_REF, OUTPUT);
+  digitalWrite(EN_REF, LOW); // Apaga VREF
+  
+  pinMode(EN_PER, OUTPUT);
+  digitalWrite(EN_PER, HIGH); // Enciende VEN(3v3_2)
+
+  // Deselect All SPI devices
+  pinMode(AD_CS, OUTPUT);
+  digitalWrite(AD_CS, HIGH);
+  
+  pinMode(CS_3, OUTPUT);
+  digitalWrite(CS_3, HIGH);
+  
+  pinMode(DP_CS, OUTPUT);
+  digitalWrite(DP_CS, HIGH);
+  
+  pinMode(MC_CS, OUTPUT);
+  digitalWrite(MC_CS, HIGH);
+  
+  //pinMode(SD_CS, OUTPUT);
+  //digitalWrite(SD_CS, HIGH);
+
+  delay(300);
+
+  pinMode(HX_DRT, OUTPUT);
+  digitalWrite(HX_DRT, set80SPS ? HIGH : LOW);
+  
+  pinMode(LED_GREEN, OUTPUT);
+  analogWrite(LED_GREEN, GNLED_BRIGHTNESS);
+  
+  pinMode(LED_ORANGE, OUTPUT);
+  analogWrite(LED_ORANGE, OGLED_BRIGHTNESS);
+  
+  // RAK WEIRD RUTINE TO AVOID CRASHING THE AT COMMANDS MCUs
+  time_t timeout = millis();
+  
+  Serial.begin(115200);
+  
+  while(!Serial) {
+    if((millis() - timeout) < 5000)
+      delay(100);
+    else
+      break;
+  }
+
+  // Try init microSD and restore RTC
+  restoreRTC();
+
+  // MCP23S17 Init
+  if (mcp.begin_SPI(MC_CS)) {
+    for(int i = 0; i < 16; i++)
+      mcp.pinMode(i, OUTPUT);
+  } else
+    Serial.println(MCP23_ERROR_INIT);
+  
+  // bq25155 Init
+  if (charger.begin(BQ_CHEN, BQ_INT, BQ_LPM)) {
+    charger.DisableRST14sWD();
+    charger.setPGasGPOD();
+    charger.DisablePG();
+  } else 
+    Serial.println(bq25155_ERROR_INIT);
+  
+  // AD5242#1 Init
+  if(!POT1.begin(1000000))
+    Serial.println(POT1_ERROR_INIT);
+
+  // AD5242#2 Init
+  if(!POT2.begin(1000000))
+    Serial.println(POT2_ERROR_INIT);
+
+  // HX711 Init
+  LoadCell.begin();
+  
+  LoadCell.setReverseOutput(); // Comment if arrow Cell points down
+  LoadCell.start(HX_stabilize_t, HX_iniTare);
+  
+  if (LoadCell.getTareTimeoutFlag())
+    Serial.println(HX711_ERROR_INIT);
+  else {
+    LoadCell.setCalFactor(calibrationValue);
+
+    while(!LoadCell.update());
+
+    convTime = LoadCell.getConversionTime();
+    lastSPS = LoadCell.getSPS();
+    settTime = LoadCell.getSettlingTime();
+
+    if(lastSPS < 7 || lastSPS > 100)
+      Serial.println(HX711_ERROR_INIT);
+  }
+
+  /* // ADS1220 Init
+  if(!ads.init())
+    Serial.println(ADS1220_ERROR_INIT);
+  else {
+    // The voltages to be measured need to be between negative VREF + 0.2 V and positive
+    // VREF -0.2 V if PGA is enabled. For this example I disable PGA, to be on the safe side.
+     
+    // ads.bypassPGA(true);
+    ads.setAvddAvssAsVrefAndCalibrate();
+    ads.setCompareChannels(ADS1220_MUX_1_2);
+  }*/
+  
+  analogReadResolution(ADC_bits);
+}
+
+void loop() {
+
+  // Update sensor variables
+  unsigned long nowsense = millis();
+  if (nowsense - lastSensTime >= sensInterval) {
+    is_CHG_Set = charger.isChargeEnabled();
+    is_CHG_DONE = charger.is_CHARGE_DONE();
+    is_Vin_PG = charger.is_VIN_PGOOD();
+    is_PG_En = charger.isPGEnabled();
+
+    INVo = charger.readVIN(1);
+    INCu = charger.readIIN(2);
+    VBAT = charger.readVBAT(1);
+    ICHG = charger.readICHG(2);
+
+    if (TempEn || RHumEn || PresEn || GasEn)
+      if (!readBME(TempEn, RHumEn, PresEn, GasEn))
+        Serial.println(BME_WARNING);
+
+    if (LUXEn)
+      if (!readLTR(LUXType == 2 ? true : false))
+        Serial.println(LTR_WARNING);
+
+    readHX7();
+    
+    lastSensTime = nowsense;
+  }
+
+  if (Serial.available()) {
+    String in = Serial.readStringUntil('\n');
+    in.trim();
+    if (in.length() > 0) {
+      if (in.length() == 1 && in.charAt(0) == MUX32_ALIVE) {
+        // Ping request
+        Serial.println(MUX32_SUCCESS);
+
+      } else if (sscanf(in.c_str(), "%d_%d_%d_%d_%d_%d", &Y, &Mo, &D, &H, &Mi, &S) == 6) {
+        setTime(H, Mi, S, D, Mo, Y);
+
+        Serial.print(F("RTC set to: "));
+        Serial.println(fmtDTT(now(), 1));
+
+        // Save to SD
+        Serial.println(uSD_DTT_update());
+
+      } else if (in.equalsIgnoreCase(MUX32_DT_STAT)) {
+        // DTT request
+        Serial.println(fmtDTT(now(), 1));
+
+      } else if (in.equalsIgnoreCase(MUX32_CH_EN)) {
+        // Charge enable
+        if (charger.initCHG(
+          BAT_VOLTAGE_mV,   // Target charge voltage in mV
+          true,             // Enable fast charging?
+          CHG_CURRENT_uA,   // Charge current in uA
+          PCHG_CURRENT_uA,  // Precharge current in uA
+          INPT_CURRENT_mA,  // Input current limit in mA
+          SAFETY_TIMER      // Safety timer in tenths of an hour (e.g., 15 = 1.5h, 30 = 3h)
+        )) {
+          charger.DisableRST14sWD();
+          charger.DisablePG();
+
+          Serial.println(MUX32_SUCCESS);
+        } else {
+          charger.DisableCharge();
+          charger.EnablePG();
+          Serial.println(bq25155_ERROR_INIT);
+        }
+
+      } else if (in.equalsIgnoreCase(MUX32_CH_DIS)) {
+        // Charge disabled
+        if (charger.DisableCharge()) {
+          charger.DisablePG();
+          Serial.println(MUX32_SUCCESS);
+        } else {
+          Serial.println(bq25155_ERROR_INIT);
+        }
+
+      } else if (in.equalsIgnoreCase(MUX32_CH_VBAT)) {
+        // Vbat only
+        VBAT = charger.readVBAT(1);
+        Serial.println(VBAT);
+        
+      } else if (in.equalsIgnoreCase(MUX32_CH_STAT)) {
+        // Charger status
+        Serial.print("ChSet:"+String(is_CHG_Set)+",");
+        Serial.print("ChDn:"+String(is_CHG_DONE)+",");
+        Serial.print("VinOK:"+String(is_Vin_PG)+",");
+        Serial.print("PGEn:"+String(is_PG_En)+",");
+        Serial.print("INVo:"+String(INVo)+",");
+        Serial.print("INuA:"+String(INCu)+",");
+        Serial.print("BatV:"+String(VBAT)+",");
+        Serial.println("CHuA:"+String(ICHG));
+        
+      } else switch (currentMode) {
+        case MODE_IDLE:
+          if (in.length() == 1 && in.charAt(0) == MUX32_SETUP) {
+            currentMode = MODE_CONFIG;
+
+            lastDataTime = millis();
+
+            Serial.println(MUX32_SUCCESS);
+
+          } else
+            Serial.println(MUX32_INVALID_COMMAND);
+          break;
+
+        case MODE_CONFIG:
+          if (in.length() == 3 && in.equalsIgnoreCase(MUX32_END_OF_TEST)) {
+
+            currentMode = MODE_IDLE;
+
+            Serial.println(MUX32_SUCCESS);
+          } else {
+            if (parseConfig(in)) {
+
+              currentMode = MODE_DATAREQ;
+              lastDataTime = millis();
+
+              callDataHeader(Serial);
+              Serial.println();
+
+            } else
+              Serial.println(MUX32_INVALID_PAYLOAD);
+          }
+          break;
+        case MODE_DATAREQ:
+          if (tolower(in.charAt(0)) == MUX32_PAUSE_TEST) {
+            // pause/resume test
+            paused = !paused;
+            Serial.println(MUX32_SUCCESS);
+          } else if (tolower(in.charAt(0)) == MUX32_MANUAL_REQ) {
+            // manual request
+            sendData();
+          } else if (tolower(in.charAt(0)) == MUX32_TARE_HX) {
+            // tare comand
+            if (extLoadAvailable) {
+              LoadCell.tareNoDelay();
+
+              bool tare_ok = taredLoadcell();
+              Serial.println(tare_ok ? MUX32_SUCCESS : HX711_ERROR_INIT);
+
+            } else
+              Serial.println(MUX32_INVALID_COMMAND);
+            
+          } else if (in.equalsIgnoreCase(MUX32_END_OF_TEST)) {
+            // End test command
+            currentMode = MODE_IDLE;
+            resetSensors();
+
+            Serial.println(MUX32_SUCCESS);
+          }
+          break;
+        default:
+          Serial.println(MUX32_INVALID_COMMAND);
+          break;
+      }
+    }
+  }
+
+  // Data burst (if auto send config)
+  if (currentMode == MODE_DATAREQ && !paused) {
+    unsigned long nowdata = millis();
+    if (nowdata - lastDataTime >= dataInterval) {
+      // sendData(); // disabled for now
+      lastDataTime = nowdata;
+    }
+  }
+
+  // Autosave Date&Time
+  if (sdDueToSave())
+    int dttsaved = uSD_DTT_update();
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+// Data format helper functions
+//----------------------------------------------------------------------------------------------------------------------
+
+// Material Name
+const __FlashStringHelper* sensorName(char materialType) {
+  switch (materialType) {
+    case CNT_GFW:  return F("CNT-GFW/VER");
+    case GS_GFW:  return F("GS-GFW/VER");
+    case MWCNT:  return F("MWCNT/PP");
+    case MXENE:  return F("MXene Nanosheets");
+    case CX_ALPHA:  return F("Cx-Alpha");
+    default:     return F("Unknown material");
+  }
+}
+
+// Double digit format helper
+String formNum(uint8_t nmbr) {
+  // Format to have leading zeros
+  if (nmbr < 10)
+    return "0" + String(nmbr);
+  else
+    return String(nmbr);
+}
+
+// Split str by delimiter
 int split(const String &str, char delim, String arr[], int maxParts) {
   int cnt = 0, start = 0, idx;
   while (cnt < maxParts - 1 && (idx = str.indexOf(delim, start)) != -1) {
@@ -470,11 +788,15 @@ int split(const String &str, char delim, String arr[], int maxParts) {
   return cnt;
 }
 
+//----------------------------------------------------------------------------------------------------------------------
+// System Helper Functions
+//----------------------------------------------------------------------------------------------------------------------
+
 // Parse the initial‐configuration payload; return true on success
 bool parseConfig(const String &payload) {
   const int MAX_FIELDS = 16;
   String fields[MAX_FIELDS];
-  int n = split(payload, MUX_PAY_DEL, fields, MAX_FIELDS);
+  int n = split(payload, MUX_PLD_DEL, fields, MAX_FIELDS);
 
   if (n < 1) return false;
   
@@ -614,7 +936,7 @@ bool parseConfig(const String &payload) {
     else {
       extLoadAvailable = true;
       
-      extLoadCapacity  = (uint32_t) sub7[1].toInt();
+      HX_Cell_Capacity  = (uint32_t) sub7[1].toInt();
       extLoadUnits     = (uint8_t) sub7[3].toInt(); //1 = g, 2 = N, 3 = kg
     }
     
@@ -633,9 +955,9 @@ bool parseConfig(const String &payload) {
       hasDelam       = true;
     
     sampleNumber     = (uint16_t) fields[12].toInt();
-    totalChannels    = (uint16_t) fields[13].toInt();
+    totalChannels    = (uint8_t) fields[13].toInt();
 
-    if(materialType == MWCNT || materialType == MXENE || materialType == CX_ALPHA){
+    if(materialType == MWCNT || materialType == MXENE || materialType == CX_ALPHA) {
       String sub14[2];
       split(fields[14], '_', sub14, 2);
       totalColumns     = (uint16_t) sub14[0].toInt();
@@ -703,7 +1025,7 @@ bool parseConfig(const String &payload) {
     else {
       extLoadAvailable = true;
       
-      extLoadCapacity  = (uint32_t) sub7[1].toInt();
+      HX_Cell_Capacity  = (uint32_t) sub7[1].toInt();
       extLoadUnits     = (uint8_t) sub7[3].toInt(); //1 = g, 2 = N, 3 = kg
     }
     
@@ -722,9 +1044,9 @@ bool parseConfig(const String &payload) {
       hasDelam       = true;
     
     sampleNumber     = (uint16_t) fields[12].toInt();
-    totalChannels    = (uint16_t) fields[13].toInt();
+    totalChannels    = (uint8_t) fields[13].toInt();
 
-    if(materialType == MWCNT || materialType == MXENE || materialType == CX_ALPHA){
+    if(materialType == MWCNT || materialType == MXENE || materialType == CX_ALPHA) {
       String sub14[2];
       split(fields[14], '_', sub14, 2);
       totalColumns     = (uint16_t) sub14[0].toInt();
@@ -746,7 +1068,7 @@ bool parseConfig(const String &payload) {
     split(fields[3], '_', sub4, 3);
     if (sub4[0]!="H" && sub4[0]!="N") return false;
     extLoadAvailable = sub4[0].charAt(0);
-    extLoadCapacity  = (uint32_t) sub4[1].toInt();
+    HX_Cell_Capacity  = (uint32_t) sub4[1].toInt();
     extLoadUnits     = (uint8_t) sub4[2].toInt();
     materialType     = fields[4].charAt(0);
     testType         = fields[5].charAt(0);
@@ -769,7 +1091,7 @@ bool parseConfig(const String &payload) {
     totalColumns     = (uint16_t) sub9[0].toInt();
     totalRows        = (uint16_t) sub9[1].toInt();
     
-    totalChannels    = (uint16_t) fields[10].toInt();
+    totalChannels    = (uint8_t) fields[10].toInt();
     
     return true;
   }
@@ -777,328 +1099,11 @@ bool parseConfig(const String &payload) {
   return false;
 }
 
-/*** Default Functions Headers ***/
-//void scanMUX(uint8_t start = 1, uint8_t end = 21, uint16_t delay_ms = 10);
-
-void setup() {
-  pinMode(EN_SNS, OUTPUT);
-  digitalWrite(EN_SNS, LOW); // Apaga VCNT
-  
-  pinMode(EN_REF, OUTPUT);
-  digitalWrite(EN_REF, LOW); // Apaga VREF
-  
-  pinMode(EN_PER, OUTPUT);
-  digitalWrite(EN_PER, HIGH); // Enciende VEN(3v3_2)
-
-  // Deselect All SPI devices
-  pinMode(AD_CS, OUTPUT);
-  digitalWrite(AD_CS, HIGH);
-  
-  pinMode(CS_3, OUTPUT);
-  digitalWrite(CS_3, HIGH);
-  
-  pinMode(DP_CS, OUTPUT);
-  digitalWrite(DP_CS, HIGH);
-  
-  pinMode(MC_CS, OUTPUT);
-  digitalWrite(MC_CS, HIGH);
-  
-  //pinMode(SD_CS, OUTPUT);
-  //digitalWrite(SD_CS, HIGH);
-
-  delay(300);
-
-  pinMode(HX_DRT, OUTPUT);
-  digitalWrite(HX_DRT, set80SPS ? HIGH : LOW);
-  
-  pinMode(LED_GREEN, OUTPUT);
-  analogWrite(LED_GREEN, GNLED_BRIGHTNESS);
-  
-  pinMode(LED_ORANGE, OUTPUT);
-  analogWrite(LED_ORANGE, OGLED_BRIGHTNESS);
-  
-  // RAK WEIRD RUTINE TO AVOID CRASHING THE AT COMMANDS MCUs
-  time_t timeout = millis();
-  
-  Serial.begin(115200);
-  
-  while(!Serial){
-    if((millis() - timeout) < 5000)
-      delay(100);
-    else
-      break;
-  }
-
-  // Try init microSD and restore RTC
-  restoreRTC();
-
-  // MCP23S17 Init
-  if (!mcp.begin_SPI(MC_CS)) {
-    Serial.println(MCP23_ERROR_INIT);
-  } else {
-    for(int i = 0; i < 16; i++)
-      mcp.pinMode(i, OUTPUT);
-  }
-  
-  // bq25155 Init
-  if (!charger.begin(BQ_CHEN, BQ_INT, BQ_LPM))
-    Serial.println(bq25155_ERROR_INIT);
-  else{
-    charger.DisableRST14sWD();
-    charger.setPGasGPOD();
-    charger.DisablePG();
-  }
-  
-  // AD5242#1 Init
-  if(!POT1.begin(1000000))
-    Serial.println(POT1_ERROR_INIT);
-
-  // AD5242#2 Init
-  if(!POT2.begin(1000000))
-    Serial.println(POT2_ERROR_INIT);
-  
-  // BME680 Init
-  if(!bme.begin(BME_ADDR)){
-    Serial.println(BME_WARNING);
-    return;
-  }else{
-    // Set up oversampling and filter initialization
-    bme.setTemperatureOversampling(BME680_OS_8X);
-    bme.setHumidityOversampling(BME680_OS_2X);
-    bme.setPressureOversampling(BME680_OS_4X);
-    bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-    bme.setGasHeater(320, 150); // 320*C for 150 ms
-  }
-  
-  // LTR390 Init
-  if(!ltr.init()){
-    Serial.println(LTR_WARNING);
-  }
-  
-  // HX711 Init
-  LoadCell.begin();
-  
-  LoadCell.setReverseOutput(); // Comment if arrow Cell points down
-  LoadCell.start(HX_stabilize_t, HX_iniTare);
-  
-  if (LoadCell.getTareTimeoutFlag())
-    Serial.println(HX711_ERROR_INIT);
-  else {
-    LoadCell.setCalFactor(calibrationValue);
-
-    while(!LoadCell.update());
-
-    convTime = LoadCell.getConversionTime();
-    lastSPS = LoadCell.getSPS();
-    settTime = LoadCell.getSettlingTime();
-
-    if(lastSPS < 7 || lastSPS > 100)
-      Serial.println(HX711_ERROR_INIT);
-  }
-
-  /* // ADS1220 Init
-  if(!ads.init())
-    Serial.println(ADS1220_ERROR_INIT);
-  else {
-    // The voltages to be measured need to be between negative VREF + 0.2 V and positive
-    // VREF -0.2 V if PGA is enabled. For this example I disable PGA, to be on the safe side.
-     
-    // ads.bypassPGA(true);
-    ads.setAvddAvssAsVrefAndCalibrate();
-    ads.setCompareChannels(ADS1220_MUX_1_2);
-  }*/
-  
-  analogReadResolution(ADC_bits);
-}
-
-void loop() {
-
-  // Update sensor variables
-  unsigned long nowsense = millis();
-  if (nowsense - lastDataTime >= sensInterval) {
-    is_CHG_Set = charger.isChargeEnabled();
-    is_CHG_DONE = charger.is_CHARGE_DONE();
-    is_Vin_PG = charger.is_VIN_PGOOD();
-    is_PG_En = charger.isPGEnabled();
-
-    INVo = charger.readVIN(1);
-    INCu = charger.readIIN(2);
-    VBAT = charger.readVBAT(1);
-    ICHG = charger.readICHG(2);
-
-    readBME(TempEn, RHumEn, PresEn, GasEn);
-
-    if (LUXEn)
-      readLTR(LUXType == 2 ? true : false);
-
-    readHX7();
-    
-    lastSensTime = nowsense;
-  }
-
-  if (Serial.available()) {
-    String in = Serial.readStringUntil('\n');
-    in.trim();
-    if (in.length() > 0) {
-      if (in.length() == 1 && in.charAt(0) == MUX32_ALIVE) {
-        // Ping request
-        Serial.println(MUX32_SUCCESS);
-
-      } else if (sscanf(in.c_str(), "%d_%d_%d_%d_%d_%d", &Y, &Mo, &D, &H, &Mi, &S) == 6) {
-        setTime(H, Mi, S, D, Mo, Y);
-
-        Serial.print("RTC set to: ");
-        Serial.println(fmtTS(now()));
-
-        // Save to SD
-        Serial.println(uSD_DTT_update());
-
-      } else if (in.equalsIgnoreCase(MUX32_DT_STAT)) {
-        // DTT request
-        Serial.println(fmtTS(now()));
-
-      } else if (in.equalsIgnoreCase(MUX32_CH_EN)) {
-        // Charge enable
-        if (charger.initCHG(
-          BAT_VOLTAGE_mV,   // Target charge voltage in mV
-          true,             // Enable fast charging?
-          CHG_CURRENT_uA,   // Charge current in uA
-          PCHG_CURRENT_uA,  // Precharge current in uA
-          INPT_CURRENT_mA,  // Input current limit in mA
-          SAFETY_TIMER      // Safety timer in tenths of an hour (e.g., 15 = 1.5h, 30 = 3h)
-        )) {
-          charger.DisableRST14sWD();
-          charger.DisablePG();
-
-          Serial.println(MUX32_SUCCESS);
-        } else {
-          charger.DisableCharge();
-          charger.EnablePG();
-          Serial.println(bq25155_ERROR_INIT);
-        }
-
-      } else if (in.equalsIgnoreCase(MUX32_CH_DIS)) {
-        // Charge disabled
-        if (charger.DisableCharge()) {
-          charger.DisablePG();
-          Serial.println(MUX32_SUCCESS);
-        } else {
-          Serial.println(bq25155_ERROR_INIT);
-        }
-
-      } else if (in.equalsIgnoreCase(MUX32_CH_VBAT)) {
-        // Vbat only
-        VBAT = charger.readVBAT(1);
-        Serial.println(VBAT);
-        
-      } else if (in.equalsIgnoreCase(MUX32_CH_STAT)) {
-        // Charger status
-        Serial.print("ChSet:"+String(is_CHG_Set)+",");
-        Serial.print("ChDn:"+String(is_CHG_DONE)+",");
-        Serial.print("VinOK:"+String(is_Vin_PG)+",");
-        Serial.print("PGEn:"+String(is_PG_En)+",");
-        Serial.print("INVo:"+String(INVo)+",");
-        Serial.print("INuA:"+String(INCu)+",");
-        Serial.print("BatV:"+String(VBAT)+",");
-        Serial.println("CHuA:"+String(ICHG));
-        
-      } else switch (currentMode) {
-        case MODE_IDLE:
-          if (in.length() == 1 && in.charAt(0) == MUX32_SETUP) {
-            Serial.println(MUX32_SUCCESS);
-            currentMode = MODE_CONFIG;
-            lastDataTime = millis();
-          } else
-            Serial.println(MUX32_INVALID_COMMAND);
-          break;
-
-        case MODE_CONFIG:
-          if (in.length() == 3 && in.equalsIgnoreCase(MUX32_END_OF_TEST)) {
-            // End test command
-            currentMode = MODE_IDLE;
-            Serial.println(MUX32_SUCCESS);
-          } else {
-            if (parseConfig(in)) {
-              if (totalChannels == 1) {
-                channelHeader = F("Resistance (6001)");
-              }else if (totalChannels == 8) {
-                channelHeader = F("1001 <R1> (OHM), 1002 <R2> (OHM), 1003 <R3> (OHM), 1004 <R4> (OHM), "
-                                  "1006 <C1> (OHM), 1007 <C2> (OHM), 1008 <C3> (OHM), 1009 <C4> (OHM)");
-              }else if (totalChannels == 10) {
-                channelHeader = F("1001 <R1> (OHM), 1002 <R2> (OHM), 1003 <R3> (OHM), "
-                                  "1004 <R4> (OHM), 1005 <R5> (OHM), "
-                                  "1006 <C1> (OHM), 1007 <C2> (OHM), 1008 <C3> (OHM), "
-                                  "1009 <C4> (OHM), 1010 <C5> (OHM)");
-              }else if (totalChannels == 21) {
-                channelHeader = F("1-1p (6001),1-3p (6002),2-4p (6003),3-1p (6004),3-5p (6005),"
-                                  "4-2p (6006),4-6p (6007),5-3p (6008),5-7p (6009),6-4p (6010),"
-                                  "6-8p (6011),7-5p (6012),7-9p (6013),8-6p (6014),8-10p (6015),"
-                                  "9-7p (6016),9-11p (6017),10-8p (6018),10-12p (6019),"
-                                  "11-9p (6020),11-13p (6021),12-10p (6022),12-14p (6023),"
-                                  "13-11p (6024),13-15p (6025),14-12p (6026),14-16p (6027),"
-                                  "15-13p (6028),15-17p (6029),16-14p (6030),16-18p (6031),"
-                                  "17-15p (6032),17-19p (6033),18-16p (6034),18-20p (6035),"
-                                  "19-17p (6036),19-21p (6037),20-18p (6038),21-19p (6039),21-21p (6040)");
-              }//else
-              //  Serial.println(MUX32_INVALID_PAYLOAD);
-              Serial.print(F("5001 <LOAD> (VDC),5021 <DISP> (VDC),"));
-              Serial.println(channelHeader);
-            
-              currentMode = MODE_DATAREQ;
-              lastDataTime = millis();
-            } else
-              Serial.println(MUX32_INVALID_PAYLOAD);
-          }
-          break;
-        case MODE_DATAREQ:
-          if (tolower(in.charAt(0)) == MUX32_PAUSE_TEST) {
-            // pause/resume test
-            paused = !paused;
-            Serial.println(MUX32_SUCCESS);
-          } else if (tolower(in.charAt(0)) == MUX32_MANUAL_REQ) {
-            // manual request
-            sendData();
-          } else if (tolower(in.charAt(0)) == MUX32_TARE_HX) {
-            // tare comand
-            if (extLoadAvailable == 'H') {
-              
-              LoadCell.tareNoDelay();
-              if (taredLoadcell())
-                Serial.println(MUX32_SUCCESS);
-              else
-                Serial.println(HX711_ERROR_INIT);
-            } else {
-              Serial.println(MUX32_INVALID_COMMAND);
-            }
-          } else if (in.equalsIgnoreCase(MUX32_END_OF_TEST)) {
-            // End test command
-            currentMode = MODE_IDLE;
-            Serial.println(MUX32_SUCCESS);
-          }
-          break;
-      }
-    }
-  }
-
-  // Data burst (if auto send config)
-  if (currentMode == MODE_DATAREQ && !paused) {
-    unsigned long nowdata = millis();
-    if (nowdata - lastDataTime >= dataInterval) {
-      // sendData(); // disabled for now
-      lastDataTime = nowdata;
-    }
-  }
-
-  // Autosave Date&Time
-  if (sdDueToSave())
-    int dttsaved = uSD_DTT_update();
-}
-
 //----------------------------------------------------------------------------------------------------------------------
 // Channels Management
 //----------------------------------------------------------------------------------------------------------------------
 
-void initMUXes(){
+void initMUXes() {
   // Set WR & CS HIGH to initialize MUXes
   portA = GPA_CS | GPA_WR;
   portB = GPB_CS | GPB_WR;
@@ -1109,7 +1114,7 @@ void initMUXes(){
   delayMicroseconds(MCP_delay);
 }
 
-void selMUXes(){
+void selMUXes() {
   // Clear Both CS & WR to enable Ch selection
   portA &= ~(GPA_CS | GPA_WR);
   portB &= ~(GPB_CS | GPB_WR);
@@ -1120,12 +1125,12 @@ void selMUXes(){
   delayMicroseconds(MCP_delay);
 }
 
-void setMUXChannels(uint8_t chMux1, uint8_t chMux2){
+void setMUXChannels(uint8_t chMux1, uint8_t chMux2) {
   // Clamp Channels to 1–32 range
-  if (chMux1 > 32) chMux1 = 32;
+  if (chMux1 > MAX_CHANNELS) chMux1 = 32;
   if (chMux1 < 1) chMux1 = 1;
   
-  if (chMux2 > 32) chMux2 = 32;
+  if (chMux2 > MAX_CHANNELS) chMux2 = 32;
   if (chMux2 < 1) chMux2 = 1;
   
   // Convert to 0-based indexes for ADG732
@@ -1161,7 +1166,7 @@ void setMUXChannels(uint8_t chMux1, uint8_t chMux2){
   delayMicroseconds(MCP_delay);
 }
 
-void latchMUXes(){
+void latchMUXes() {
   // Set CS & WR HIGH, everything else LOW (latch)
   portA = GPA_CS | GPA_WR;
   portB = GPB_CS | GPB_WR;
@@ -1230,16 +1235,43 @@ float LowerWheatstoneBridge(uint8_t R1, uint8_t R2, uint8_t RU, int32_t VWB, uin
   return RL;  // In ohms
 }
 
-void setDigitPots(uint8_t DP1R1, uint8_t DP1R2, uint8_t DP2R3){
+void setDigitPots(uint8_t DP1R1, uint8_t DP1R2, uint8_t DP2R3) {
     POT1.write(0, DP1R1);
     POT1.write(1, DP1R2);
     
     POT2.write(0, DP2R3);
     POT2.write(1, DP2R3);
 }
+/*
+// MUX channel Builder
+uint8_t buildMuxConfig(uint8_t totalChannels, MuxPair* dst, uint8_t dstCapacity) {
+  if (!dst || dstCapacity == 0) return 0;
 
+  // Clamp request to [1..32]
+  if (totalChannels < 1) totalChannels = 1;
+  if (totalChannels > MAX_CHANNELS) totalChannels = MAX_CHANNELS;
+
+  // Special case (21)
+  if (totalChannels == 21) {
+    const uint8_t count = (dstCapacity < XX_READINGS) ? dstCapacity : XX_READINGS;
+    for (uint8_t i = 0; i < count; ++i) dst[i] = SPECIAL_21[i];
+    return count;
+  }
+
+  // General case
+  uint8_t written = 0;
+  for (uint8_t ch = 1; ch <= totalChannels; ++ch) {
+    if ((ch != 27 || ch != 29 || ch != 30)) { // skip 27, 29, 30
+      if (written >= dstCapacity) break; // avoid overflow
+      dst[written++] = MuxPair{ch, ch};
+    }
+  }
+
+  return written;
+}
+*/
 // read ADC
-void readADC(uint32_t deluSecs){
+void readADC(uint32_t deluSecs) {
 // Find a way to set all resistances voltage values to zero bridge (only first init)
 // an array to store each R4 of wheatstone bridge?
   uint8_t PR1 = 255;
@@ -1247,10 +1279,10 @@ void readADC(uint32_t deluSecs){
   uint8_t PR3 = 255;
 
   setDigitPots(PR1, PR2, PR3);
-  
+
   initMUXes();
   
-  for (uint8_t i = 0; i < ADS_READINGS; i++) {
+  for (uint8_t i = 0; i < GFW_READINGS; i++) {
     setMUXChannels(GFW_chs[i].ch1, GFW_chs[i].ch2);
 
     if (!i)
@@ -1270,12 +1302,34 @@ void readADC(uint32_t deluSecs){
 }
 
 //----------------------------------------------------------------------------------------------------------------------
-// Sensors Data Management
+// Sensors Management
 //----------------------------------------------------------------------------------------------------------------------
 
 // Ambient sensor read
 static bool readBME(bool temp, bool rhum, bool atmpr, bool gas) {
-  if (bme.performReading()) {
+  
+  if (!bmeSet) {
+    // BME680 Init
+    bmeEnabled = bme.begin(BME_ADDR);
+
+    if (bmeEnabled) {
+      // Set up oversampling and filter initialization
+      bme.setTemperatureOversampling(BME680_OS_8X);
+      bme.setHumidityOversampling(BME680_OS_2X);
+      bme.setPressureOversampling(BME680_OS_4X);
+      bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
+
+      if (gas)
+        bme.setGasHeater(320, 150); // 320*C for 150 ms
+      else
+        bme.setGasHeater(0, 0);
+      
+      bmeSet = true;
+    } else
+      return false;
+  }
+
+  if (bmeSet && bmeEnabled && bme.performReading()) {
     
     BME_temp = (temp ? bme.temperature : 0.0); // in C
     BME_humr = (rhum ? bme.humidity : 0.0); // in rH%
@@ -1289,27 +1343,47 @@ static bool readBME(bool temp, bool rhum, bool atmpr, bool gas) {
 
 // Lux sensor read
 static bool readLTR(bool UVI) {
-  
-  // if set LTR390_MODE_UVS, get UV light data.
-  // if set LTR390_MODE_ALS, get ambient light data
-  if (UVI)
-    ltr.setMode(LTR390_MODE_UVS);
-  else
-    ltr.setMode(LTR390_MODE_ALS);
-  
-  // perform data reading:
-  if (ltr.newDataAvailable()) {
-    if(ltr.getMode() == LTR390_MODE_ALS) {
-      LTR_XXS = ltr.readALS();
-      LTR_IDX = ltr.getLUX();
-    } else {
-      LTR_XXS = ltr.readUVS();
-      LTR_IDX = ltr.getUVI();
-    }
 
-    return true;
-  } else
-    return false;
+  if (!LTRSet) {
+    // LTR390 Init
+    LTREnabled = ltr.init();
+
+    if(LTREnabled) {
+      switch (LUXBits) {
+        case 20: ltr.setResolution(LTR390_RESOLUTION_20BIT); break;
+        case 19: ltr.setResolution(LTR390_RESOLUTION_19BIT); break;
+        case 18: ltr.setResolution(LTR390_RESOLUTION_18BIT); break;
+        case 17: ltr.setResolution(LTR390_RESOLUTION_17BIT); break;
+        case 16: ltr.setResolution(LTR390_RESOLUTION_16BIT); break;
+        case 13: ltr.setResolution(LTR390_RESOLUTION_13BIT); break;
+        default: return false; // invalid bit setting
+      }
+
+      LTRSet = true;
+    } else
+      return false;
+  }
+
+  if(LTREnabled && LTRSet) {
+    if (UVI)
+      ltr.setMode(LTR390_MODE_UVS); // if set LTR390_MODE_UVS, get UV light data.
+    else
+      ltr.setMode(LTR390_MODE_ALS); // if set LTR390_MODE_ALS, get ambient light data
+    
+    // perform data reading:
+    if (ltr.newDataAvailable()) {
+      if(ltr.getMode() == LTR390_MODE_ALS) {
+        LTR_XXS = ltr.readALS();
+        LTR_IDX = ltr.getLUX();
+      } else {
+        LTR_XXS = ltr.readUVS();
+        LTR_IDX = ltr.getUVI();
+      }
+
+      return true;
+    }
+  }
+  return false;
 }
 
 // Loadcell ADC read
@@ -1332,17 +1406,61 @@ static bool taredLoadcell() {
     return false;
 }
 
+static void resetSensors() {
+  //BME
+  if (bmeSet && bmeEnabled) {
+    bme.setTemperatureOversampling(BME680_OS_NONE);
+    bme.setHumidityOversampling(BME680_OS_NONE);
+    bme.setPressureOversampling(BME680_OS_NONE);
+    bme.setIIRFilterSize(BME680_FILTER_SIZE_0);
+    bme.setGasHeater(0, 0);
+
+    bmeSet = false;
+    bmeEnabled = false;
+    
+    TempEn = false;
+    RHumEn = false;
+    PresEn = false;
+    GasEn = false;
+
+  }
+
+  if (LTRSet && LTREnabled) {
+    ltr.enable(false);
+
+    LTRSet = false;
+    LTREnabled = false;
+
+    LUXEn = false;
+  }
+
+  if (isSDins) {
+    // Finish uSD comunication
+    SD.end();
+
+    isSDins = false;
+    is1stIt = true;
+    fid++;
+  }
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+// RTC Parameters Management
+//----------------------------------------------------------------------------------------------------------------------
+
 static void restoreRTC() {
   if (SD.begin(SD_CS)) {
     // Check for file first
     if (SD.exists(setts_file)) {
       // Load from SD and set RTC
       uint32_t e = 0;
+
       if (sdLoadEpoch(e) && e > 1000000000UL) {
         setTime(e);
         lastSavedYMD = packYMD(year(), month(), day());
       } else
         defaultRTC();
+
     } else {
       // Use the initial defaults
       tmElements_t tm;
@@ -1375,16 +1493,21 @@ static void defaultRTC() {
 }
 
 static uint8_t uSD_DTT_update() {
-  if (SD.begin(SD_CS)) {
-    if (sdSaveEpoch(now())) {
-      SD.end();
+  // Init microSD if not initiated
+  if (!isSDins)
+    isSDins = SD.begin(SD_CS);
 
+  if (isSDins) {
+    if (sdSaveEpoch(now()))
       return MUX32_SUCCESS;
-    } else {
-      SD.end();
-
+    else
       return DTT_WARNING;
+    
+    if (currentMode != MODE_DATAREQ) {
+      SD.end();
+      isSDins = false;
     }
+
   } else
     return SDCARD_WARNING;
 }
@@ -1426,22 +1549,17 @@ static bool sdLoadEpoch(uint32_t &outEpoch) {
 }
 
 static bool sdSaveEpoch(time_t t) {
-  // Open for write (will overwrite existing file)
+  if (SD.exists(setts_file))
+    SD.remove(setts_file);
+
   DTTSettings = SD.open(setts_file, FILE_WRITE);
   if (!DTTSettings) return false;
 
-  // Since there is not support truncate(), we must remove & recreate
-  DTTSettings.close();
-  SD.remove(setts_file);
-  
-  DTTSettings = SD.open(setts_file, FILE_WRITE);
-  if (!DTTSettings) return false;
-
-  // Write both machine- and human-friendly versions
+  // Write both machine and human-friendly versions
   DTTSettings.print("EPOCH=");
   DTTSettings.println((uint32_t)t);
   DTTSettings.print("HUMAN=");
-  DTTSettings.println(fmtTS(t));
+  DTTSettings.println(fmtDTT(t, 0));
 
   DTTSettings.flush();
   DTTSettings.close();
@@ -1463,80 +1581,83 @@ static uint16_t packYMD(int y, int m, int d) {
   return uint16_t(y % 100) * 10000 + uint16_t(m) * 100 + uint16_t(d);
 }
 
-// format epoch as "YYYY_MM_DD_HH_MM_SS" 
-static String fmtTS(time_t t) {
+static String fmtDTT(time_t t, uint8_t formtype) {
   char b[20];
-  snprintf(b, sizeof(b), "%04d_%02d_%02d_%02d_%02d_%02d", year(t), month(t), day(t), hour(t), minute(t), second(t));
+  if (formtype == 0) {
+    // format epoch as "YYYY_MM_DD_HH_MM_SS"
+    snprintf(b, sizeof(b), "%04d_%02d_%02d_%02d_%02d_%02d", year(t), month(t), day(t), hour(t), minute(t), second(t));
+  } else if (formtype == 1) {
+    // format epoch as "YYYY-MM-DD_HH:MM:SS"
+    snprintf(b, sizeof(b), "%04d-%02d-%02d_%02d:%02d:%02d", year(t), month(t), day(t), hour(t), minute(t), second(t));
+  }
+
   return String(b);
 }
 
-bool save2SD(){
-  uint8_t fnum = 1;
-  
-  String extn = ".txt";
-  String fname = formNum(fnum)+extn;
-  
-  if (isSDins) {
-    if (is1stIt) {
-      while (SD.exists(fname)) {
-        fnum++;
-        fname = formNum(fnum)+extn;
-      }
-      
-      is1stIt = false;
-      uSD_row = 1;
-    }
-
-    //------- Write SD file --------
-    DataSD = SD.open(fname, FILE_WRITE);
-    if(uSD_row==1){
-      DataSD.print("Scan,Time,5001 <LOAD> (VDC),5021 <DISP> (VDC),");
-      DataSD.print("6001 (OHM),6002 (OHM),6003 (OHM),6004 (OHM),6005 (OHM),6006 (OHM),6007 (OHM),6008 (OHM),6009 (OHM),6010 (OHM),");
-      DataSD.print("6011 (OHM),6012 (OHM),6013 (OHM),6014 (OHM),6015 (OHM),6016 (OHM),6017 (OHM),6018 (OHM),6019 (OHM),6020 (OHM),");
-      DataSD.print("6021 (OHM),6022 (OHM),6023 (OHM),6024 (OHM),6025 (OHM),6026 (OHM),6027 (OHM),6028 (OHM),6029 (OHM),6030 (OHM),");
-      DataSD.println("6031 (OHM),6032 (OHM),6033 (OHM),6034 (OHM),6035 (OHM),6036 (OHM),6037 (OHM),6038 (OHM),6039 (OHM),6040 (OHM)");
-    }
-    
-    DataSD.print(String(uSD_row)+",");
-    DataSD.print(String(uSD_row * 100)+",");
-    DataSD.print(String(charger.readVBAT(1))+",");
-    DataSD.print(String(charger.readVBAT(1))+",");
-    
-    for (uint8_t i = 0; i < ADS_READINGS; i++) {
-      DataSD.print(readings_uV[i]);
-      if (i<(ADS_READINGS-1))
-        DataSD.print(","); // Add a comma between vals
-    }
-    
-    DataSD.println(); // Add a newline
-    DataSD.close();
-  }
-}
-
-// Double digit format
-String formNum(uint8_t nmbr){
-  // Format to have leading zeros
-  if (nmbr < 10)
-    return "0" + String(nmbr);
-  else
-    return String(nmbr);
-}
-
+//----------------------------------------------------------------------------------------------------------------------
 // Data Payload
+//----------------------------------------------------------------------------------------------------------------------
+// MUX32,C_H_N_N,ALS_16,S,500,D_1.0_10_1,L_100_1.0_2,N_0_0,C,C,5_5_1,D,1,21
+// Call like: Serial and SD (File inherits from Print)
+void callDataHeader(Print& out) {
+  bool needComma = false;
+
+  if (totalChannels == 0) return;
+
+  if (loadAvailable) { out.print(F("5001 <LOAD> (VDC)")); needComma = true; }
+  if (dispAvailable) { if (needComma) out.print(','); out.print(F("5021 <DISP> (VDC)")); needComma = true; }
+
+  if (totalChannels == 21) {
+    if (needComma) out.print(',');
+    out.print(F("1-1p (6001),1-3p (6002),2-4p (6003),3-1p (6004),3-5p (6005),"
+                "4-2p (6006),4-6p (6007),5-3p (6008),5-7p (6009),6-4p (6010),"
+                "6-8p (6011),7-5p (6012),7-9p (6013),8-6p (6014),8-10p (6015),"
+                "9-7p (6016),9-11p (6017),10-8p (6018),10-12p (6019),"
+                "11-9p (6020),11-13p (6021),12-10p (6022),12-14p (6023),"
+                "13-11p (6024),13-15p (6025),14-12p (6026),14-16p (6027),"
+                "15-13p (6028),15-17p (6029),16-14p (6030),16-18p (6031),"
+                "17-15p (6032),17-19p (6033),18-16p (6034),18-20p (6035),"
+                "19-17p (6036),19-21p (6037),20-18p (6038),21-19p (6039),21-21p (6040)"
+              ));
+    return;
+  }
+
+  const uint8_t maxPairs = 10;
+
+  uint8_t nR = (totalChannels + 1) / 2;
+  if (nR > maxPairs) nR = maxPairs;
+
+  uint8_t nC = totalChannels - nR;
+  if (nC > maxPairs) nC = maxPairs;
+
+  for (uint8_t i = 1; i <= nR; ++i) {
+    if (needComma) out.print(',');
+    out.print(1000 + i); out.print(F(" <R")); out.print(i); out.print(F("> (OHM)"));
+  }
+
+  for (uint8_t i = 1; i <= nC; ++i) {
+    out.print(','); out.print(1010 + i); out.print(F(" <C")); out.print(i); out.print(F("> (OHM)"));
+  }
+
+  if (TempEn) {out.print(F(",<Temp.> (")); out.print(TempUnits); out.print(F(")"));}
+  if (RHumEn) {out.print(F(",<RHum.> (%)"));}
+  if (PresEn) {out.print(F(",<AtmP.> (")); out.print(PresUnits); out.print(F(")"));}
+  if (GasEn)  {out.print(F(",<Gas> (")); out.print(GasUnits); out.print(F(")"));}
+  if (LUXEn)  {out.print(F(",<")); out.print(LUXType); out.print(F("> (Lux)"));}
+}
+
 void sendData() {
   /*
   readADC(20);
-  // make uid universal
-  save2SD();
   
   Serial.print(String(uSD_row)+",");
   Serial.print(String(uSD_row * 100)+",");
   Serial.print(String(charger.readVIN(1))+",");
   Serial.print(String(charger.readVBAT(1))+",");
   
-  for (uint8_t i = 0; i < ADS_READINGS; i++) {
+  for (uint8_t i = 0; i < GFW_READINGS; i++) {
     Serial.print(readings_uV[i]);
-    if (i<(ADS_READINGS-1))
+    if (i<(GFW_READINGS-1))
       Serial.print(","); // Add a comma between vals
   }
   */
@@ -1553,4 +1674,79 @@ void sendData() {
   Serial.print(","+String(charger.readVBAT(1)));
   
   Serial.println();
+
+  if (enuSDWrite)
+    save2uSD(month(), day());
+}
+
+//----------------------------------------------------------------------------------------------------------------------
+// Data to uSD Management
+//----------------------------------------------------------------------------------------------------------------------
+
+bool save2uSD(uint8_t fmnth, uint8_t fday) {
+  static uint8_t lfmnth, lfday;
+  uint8_t i;
+
+  if (fmnth != lfmnth || fday != lfday) {
+    is1stIt = true;
+
+    lfmnth = fmnth;
+    lfday = fday;
+
+    fid = 1;
+  }
+
+  if (is1stIt && !isSDins)
+    isSDins = SD.begin(SD_CS);
+
+  if (!isSDins) return false;
+
+  String extn = ".txt";
+  String fname = formNum(fmnth)+"-"+formNum(fday)+"-"+formNum(fid)+extn;
+
+  if (is1stIt) {
+    while (SD.exists(fname)) {
+      fid++;
+      fname = formNum(fmnth)+"-"+formNum(fday)+"-"+formNum(fid)+extn;
+    }
+    
+    uSD_row = 1;
+    is1stIt = false;
+  }
+
+  //------- Write SD file --------
+  DataSD = SD.open(fname, FILE_WRITE);
+  
+  if (!DataSD) return false;
+
+  // if file is new, write header
+  if (uSD_row == 1) {
+    DataSD.print(F("Records of "));
+    DataSD.print(sensorName(materialType));
+    DataSD.println(F(" sensor using MUX32."));
+
+    DataSD.print(F("Scan,Time,"));
+
+    callDataHeader(DataSD);
+
+    DataSD.println(); // Add a newline
+  }
+  
+  DataSD.print(String(uSD_row)+",");
+  DataSD.print(fmtDTT(now(), 1)+","); // pending init and end time in ms
+  
+  for (uint8_t i = 0; i < totalChannels; i++) {
+    //DataSD.print(readings_uV[i]);
+    DataSD.print(i+1);
+    DataSD.print(","); // Add a comma between vals
+  }
+  
+  DataSD.print(charger.readVBAT(1));
+
+  DataSD.println(); // Add a newline
+  DataSD.close();
+
+  uSD_row++;
+  
+  return true;
 }
